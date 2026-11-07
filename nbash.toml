@@ -1,0 +1,60 @@
+# NBA Street Homecourt (USA) - XenonRecomp project config
+# Title ID 454107F7, nbastreet_ntsc.pe, XDK 2.0.4929
+[main]
+file_path = "default.xex"
+out_directory_path = "ppc"
+switch_table_file_path = "nbash_switch_tables.toml"
+
+skip_lr = false
+skip_msr = false
+ctr_as_local = false
+xer_as_local = false
+reserved_as_local = false
+cr_as_local = false
+non_argument_as_local = false
+non_volatile_as_local = false
+
+restgprlr_14_address = 0x824F0080
+savegprlr_14_address = 0x824F0030
+restfpr_14_address = 0x824F065C
+savefpr_14_address = 0x824F0610
+restvmx_14_address = 0x824F0378
+savevmx_14_address = 0x824F00E0
+restvmx_64_address = 0x824F040C
+savevmx_64_address = 0x824F0174
+
+longjmp_address = 0x824F1370
+setjmp_address = 0x824F1490
+
+# Data stored at the end of .text ("HVEH" exception-handler table at 0x825249D0,
+# runs to the end of the section) - skip it instead of decoding it as code.
+invalid_instructions = [
+    { data = 0x00485645, size = 0x7FC },
+]
+
+# Function boundaries fixed by hand: the analyzer ended these functions at their
+# jump-table bctr (or ran one function into the next). Sizes traced by control flow.
+functions = [
+    { address = 0x821E65D0, size = 0x28 },
+    { address = 0x82201278, size = 0x78 },
+    { address = 0x82201710, size = 0xC8 },
+    { address = 0x82201A48, size = 0xD0 },
+    { address = 0x82201D20, size = 0xC8 },
+    { address = 0x822023B0, size = 0x98 },
+    { address = 0x82202638, size = 0x88 },
+    { address = 0x82202B20, size = 0xC8 },
+    { address = 0x82275BB8, size = 0x64C },
+    { address = 0x82287FC0, size = 0x11C },
+    { address = 0x8228CE18, size = 0x84 },
+    { address = 0x822C2588, size = 0xA8 },
+    { address = 0x8230FC10, size = 0x60 },
+    { address = 0x823FBCE8, size = 0x12C },
+    { address = 0x8241AC10, size = 0xA8 },
+    { address = 0x82450410, size = 0x74 },
+    { address = 0x82450488, size = 0x74 },
+    { address = 0x82450B90, size = 0x380 },
+    { address = 0x82451498, size = 0x1F4 },
+    { address = 0x82477A00, size = 0x15C },
+    { address = 0x82477B60, size = 0x120 },
+    { address = 0x82477C80, size = 0xD8 },
+]

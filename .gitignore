@@ -1,0 +1,23 @@
+# game files and anything derived from them: never commit
+default.xex
+*.xex
+game/
+ppc/
+*.iff
+*.big
+*.bh
+*.f1
+*.dds
+# builds and outputs
+build*/
+*.exe
+*.dll
+*.lib
+*.pdb
+*.obj
+shadercache/
+capture/
+saves/
+nbash_log*.txt
+nbash_*probe*.txt
+thirdparty/ffmpeg-win/
