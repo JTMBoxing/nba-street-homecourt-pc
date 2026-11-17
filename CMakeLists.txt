@@ -44,7 +44,9 @@ add_executable(nbash
     runtime/mods.cpp
     runtime/archivemod.cpp
     runtime/posprobe.cpp
-    runtime/statscreen.cpp
+    runtime/drivecam.cpp
+    runtime/shotswap.cpp runtime/dribseq.cpp runtime/pinwatch.cpp
+    runtime/statscreen.cpp runtime/gfxsettings.cpp runtime/optionsmenu.cpp runtime/shoes.cpp runtime/selecthover.cpp
     runtime/content.cpp
     runtime/window.cpp
     runtime/stubs.cpp)

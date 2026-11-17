@@ -17,6 +17,7 @@
 #include "statfont.h"
 
 std::string GameRoot();
+std::string NbashShoeLabel(uint32_t);      // shoes.cpp (by the player's characterDB record hash, playerstats +4)
 #ifndef STATTEST
 ID3DBlob* NbashCompileShader(const char* src, const char* name, const char* profile, const char* entry);
 #endif
@@ -25,11 +26,14 @@ void Log(const char* fmt, ...);
 namespace
 {
     const int W = 1280, H = 720;
-    struct Player { int id; std::string first, last; int team, number, cls; float height, weight; int skill[8]; };
+    struct Player { int id; uint32_t chash = 0; std::string first, last; int team, number, cls; float height, weight; int skill[8]; };
     struct Team { int id; std::string name, city; std::vector<int> players; };
     std::vector<Player> g_players; std::vector<Team> g_teams;
     std::mutex g_mx;
+    std::vector<int> g_focus; std::string g_focusTeam;      // 15 Nov: opened from the Select Team & Players screen = that team's players, hovered one first
     std::atomic<bool> g_open{false}; std::atomic<int> g_team{0}, g_slot{0}; std::atomic<int> g_version{1};
+    std::atomic<bool> g_camOpen{false}; std::atomic<int> g_camSel{0};      // camera options menu (Back button / F2)
+    std::atomic<bool> g_gfxOpen{false}; std::atomic<int> g_gfxSel{0}; std::atomic<bool> g_gfxFromGame{false};      // graphics options menu (pad Back button / F1; LB / RB switches to the camera page)
     uint32_t BE(const uint8_t* p) { return uint32_t(p[0]) << 24 | uint32_t(p[1]) << 16 | uint32_t(p[2]) << 8 | p[3]; }
     float BEf(const uint8_t* p) { uint32_t v = BE(p); float f; memcpy(&f, &v, 4); return f; }
     std::vector<uint8_t> Read(const std::string& p)
@@ -47,7 +51,7 @@ namespace
         for (size_t r = 0; r + 288 <= ps.size(); r += 288)
         {
             const uint8_t* q = &ps[r]; Player p{};
-            p.id = int(BE(q)); p.last = Str(q + 8, 32); p.first = Str(q + 40, 32);
+            p.id = int(BE(q)); p.chash = BE(q + 4); p.last = Str(q + 8, 32); p.first = Str(q + 40, 32);
             while (!p.last.empty() && !isalpha((unsigned char)p.last[0])) p.last.erase(0, 1);
             p.height = BEf(q + 144); p.weight = BEf(q + 148); p.team = int(BE(q + 152)); p.number = int(BE(q + 156)); p.cls = int(BE(q + 184));
             for (int k = 0; k < 8; k++) p.skill[k] = int(BE(q + 188 + 4 * k));
@@ -133,9 +137,12 @@ namespace
     int Overall(const Player& p) { int s = 0; for (int k = 0; k < 8; k++) s += std::min(p.skill[k], 100); return (s + 4) / 8; }
     std::string Upper(std::string s) { for (auto& c : s) c = char(toupper((unsigned char)c)); return s; }
 
+    void DrawCamMenu(); void DrawGfxMenu();
     void Draw()
     {
         g_px.assign(size_t(W) * H, 0);
+        if (g_gfxOpen && !g_open) { DrawGfxMenu(); return; }
+        if (g_camOpen && !g_open) { DrawCamMenu(); return; }
         std::lock_guard lk(g_mx);
         const uint32_t ink = Rgb(28, 24, 22), inkSoft = Rgb(92, 80, 68), red = Rgb(110, 28, 28), redDark = Rgb(70, 16, 16),
                        gold = Rgb(214, 160, 52), goldHi = Rgb(255, 205, 70), cream = Rgb(246, 240, 222), track = Rgb(214, 202, 176);
@@ -155,19 +162,26 @@ namespace
             }
         if (g_teams.empty()) { Text(M40, 640, 330, "NO PLAYER DATA FOUND", ink, 1); return; }
         int ti = ((g_team % int(g_teams.size())) + int(g_teams.size())) % int(g_teams.size());
-        const Team& t = g_teams[ti];
+        Team ft; if (!g_focus.empty()) { ft.city = g_focusTeam; ft.players = g_focus; }
+        const Team& t = g_focus.empty() ? g_teams[ti] : ft;
         int si = ((g_slot % int(t.players.size())) + int(t.players.size())) % int(t.players.size());
         const Player& p = g_players[t.players[si]];
         // header
         Text(M26, 160, 74, "PLAYER RATINGS", red);
-        Text(S20, 1120, 82, "<  " + Upper(t.city + " " + t.name) + "  >", inkSoft, 2);
+        std::string own; for (auto& tm : g_teams) if (tm.id == p.team) own = tm.city + " " + tm.name;
+        Text(S20, 1120, 82, g_focus.empty() ? "<  " + Upper(t.city + " " + t.name) + "  >" : Upper(own), inkSoft, 2);
         Fill(160, 114, 1120, 117, inkSoft, 0.5f);
         // name plate
         Text(M70, 160, 120, Upper(p.first + " " + p.last), ink);
         int inches = int(lroundf(p.height)), lbs = int(lroundf(p.weight));
         char info[128]; snprintf(info, sizeof info, "#%d    %d'%d\"    %d LBS    %s", p.number, inches / 12, inches % 12, lbs, p.cls >= 0 && p.cls < 3 ? kClass[p.cls] : "");
         Text(S20, 164, 214, info, inkSoft);
-        char rs[32]; snprintf(rs, sizeof rs, "PLAYER %d OF %zu", si + 1, t.players.size()); Text(S20, 900, 214, rs, inkSoft, 2);
+        char rs[32]; snprintf(rs, sizeof rs, "PLAYER %d OF %zu", si + 1, t.players.size()); if (g_focus.empty()) Text(S20, 900, 214, rs, inkSoft, 2);
+        // shoes (shoes.cpp): X / Y change them
+        {
+            std::string sh = NbashShoeLabel(p.chash);
+            if (!sh.empty()) { Text(S20, 164, 240, "SHOES:", red); Text(S20, 164 + TextW(S20, "SHOES:  "), 240, "<  " + Upper(sh) + "  >", ink); }
+        }
         // overall: the red tile with gold trim
         RRect(926, 128, 1120, 244, 18, gold); RRect(931, 133, 1115, 239, 14, red);
         char ov[8]; snprintf(ov, sizeof ov, "%d", Overall(p)); Text(S64, 1023, 140, ov, cream, 1);
@@ -187,7 +201,7 @@ namespace
             if (master) Text(S20, x + 6, y + 44, "MASTER", redDark, 0, 0.0f);
         }
         Fill(160, 626, 1120, 628, inkSoft, 0.4f);
-        Text(S20, 640, 638, "LEFT / RIGHT:  PLAYER        UP / DOWN:  TEAM        LB:  CLOSE", inkSoft, 1);
+        Text(S20, 640, 638, g_focus.empty() ? "LEFT / RIGHT:  PLAYER      UP / DOWN:  TEAM      X / Y:  SHOES      LB:  CLOSE" : "LEFT / RIGHT  OR  X / Y:  CHANGE SHOES        LB:  CLOSE", inkSoft, 1);
     }
 
 #ifndef STATTEST
@@ -204,7 +218,74 @@ float4 ps_main(V i) : SV_Target { return t.Sample(s, i.uv); }
 #endif
 }
 
-bool NbashStatsOpen() { return g_open.load(); }
+int NbashCamGet(); void NbashCamSet(int); const char* NbashCamName(int); const char* NbashCamHint(int); bool NbashCamAvailable(); extern const int kNbashCamCount;
+extern const int kNbashGfxRows; const char* NbashGfxName(int); const char* NbashGfxValue(int); const char* NbashGfxHint(int); void NbashGfxStep(int row, int d);
+namespace
+{
+    void DrawCamMenu()
+    {
+        const uint32_t gold = Rgb(255, 205, 70), cream = Rgb(246, 240, 222), soft = Rgb(170, 160, 140), dark = Rgb(10, 10, 12), red = Rgb(140, 34, 34);
+        int n = kNbashCamCount, rowH = 62, X0 = 400, X1 = 880, Y0 = 150, Y1 = Y0 + 96 + n * rowH + 86, sel = g_camSel.load();
+        RRect(X0 - 6, Y0 - 6, X1 + 6, Y1 + 6, 22, gold, 0.9f);
+        RRect(X0, Y0, X1, Y1, 18, dark, 0.93f);
+        Text(M40, (X0 + X1) / 2, Y0 + 26, "CAMERA", gold, 1);
+        for (int i = 0; i < n; i++)
+        {
+            int y = Y0 + 92 + i * rowH;
+            if (i == sel) RRect(X0 + 22, y - 4, X1 - 22, y + rowH - 10, 12, red, 0.95f);
+            Text(S34, X0 + 44, y + 2, NbashCamName(i), i == sel ? cream : soft);
+            if (i == sel) Text(S20, X0 + 44, y + 34 - 6 + 6, NbashCamHint(i), cream, 0, 0.0f);
+        }
+        Text(S20, (X0 + X1) / 2, Y1 - 78, NbashCamHint(sel), cream, 1);
+        Text(S20, (X0 + X1) / 2, Y1 - 44, "Up / Down: choose     LB / RB: Graphics     A or Back: close", soft, 1);
+    }
+    void DrawGfxMenu()
+    {
+        const uint32_t gold = Rgb(255, 205, 70), cream = Rgb(246, 240, 222), soft = Rgb(170, 160, 140), dark = Rgb(10, 10, 12), red = Rgb(140, 34, 34);
+        int n = kNbashGfxRows, rowH = 62, X0 = 340, X1 = 940, Y0 = 150, Y1 = Y0 + 96 + n * rowH + 86, sel = g_gfxSel.load();
+        RRect(X0 - 6, Y0 - 6, X1 + 6, Y1 + 6, 22, gold, 0.9f);
+        RRect(X0, Y0, X1, Y1, 18, dark, 0.93f);
+        Text(M40, (X0 + X1) / 2, Y0 + 26, "GRAPHICS", gold, 1);
+        for (int i = 0; i < n; i++)
+        {
+            int y = Y0 + 92 + i * rowH;
+            if (i == sel) RRect(X0 + 22, y - 4, X1 - 22, y + rowH - 10, 12, red, 0.95f);
+            Text(S34, X0 + 44, y + 2, NbashGfxName(i), i == sel ? cream : soft);
+            Text(S34, X1 - 44, y + 2, std::string(i == sel ? "<  " : "") + NbashGfxValue(i) + (i == sel ? "  >" : ""), i == sel ? gold : soft, 2);
+        }
+        Text(S20, (X0 + X1) / 2, Y1 - 78, NbashGfxHint(sel), cream, 1);
+        Text(S20, (X0 + X1) / 2, Y1 - 44, NbashCamAvailable() ? "Up / Down: choose     Left / Right: change     LB / RB: Camera     B: back" : "Up / Down: choose     Left / Right: change     B: back", soft, 1);
+    }
+}
+namespace { std::atomic<uint64_t> g_acceptMs{0}; }
+uint64_t NbashMsSinceAccept() { uint64_t t = g_acceptMs.load(); return t ? GetTickCount64() - t : 1000000; }
+void NbashGfxMenuOpen()      // from the game's own Options screen (optionsmenu.cpp)
+{
+    if (g_open || g_gfxOpen) return;
+    g_camOpen = false; g_gfxOpen = true; g_gfxFromGame = true; g_version++; Log("[graphics menu] opened from the Options screen\n");
+}
+void NbashGfxMenuToggle()
+{
+    if (g_open) return;
+    bool o = !g_gfxOpen.load(); if (o) g_camOpen = false;
+    g_gfxOpen = o; g_version++; Log("[graphics menu] %s\n", o ? "opened" : "closed");
+}
+// camera options menu: toggled by the pad's Back button or F2; up / down picks (applies at once and is remembered)
+void NbashGfxMenuToggle();
+void NbashCamMenuToggle()
+{
+    if (g_gfxOpen) { NbashGfxMenuToggle(); return; }
+    if (!NbashCamAvailable()) { NbashGfxMenuToggle(); return; }
+    if (g_open) return;
+    bool o = !g_camOpen.load(); if (o) g_camSel = NbashCamGet();
+    g_camOpen = o; g_version++; Log("[camera menu] %s\n", o ? "opened" : "closed");
+}
+void NbashCamMenuMove(int d)
+{
+    if (!g_camOpen) return;
+    int s = ((g_camSel.load() + d) % kNbashCamCount + kNbashCamCount) % kNbashCamCount; g_camSel = s; NbashCamSet(s); g_version++;
+}
+bool NbashStatsOpen() { return g_open.load() || g_camOpen.load() || g_gfxOpen.load(); }
 std::vector<int> NbashStatsPlayerIds() { Load(); std::vector<int> v; std::lock_guard lk(g_mx); for (auto& p : g_players) v.push_back(p.id); return v; }
 
 // called by the input code with player 1's fresh button presses (XInput bits); returns true if it took the input
@@ -215,15 +296,80 @@ bool NbashStatsInput(uint16_t pressed, bool inMatch)
         static uint64_t last[16];
         uint64_t now = GetTickCount64(); uint16_t fresh = 0;
         for (int b = 0; b < 16; b++) if (pressed & (1 << b)) { if (now - last[b] > 150) fresh |= uint16_t(1 << b); last[b] = now; }
-        if (!fresh) return g_open.load();
+        if (!fresh) return g_open.load() || g_camOpen.load() || g_gfxOpen.load();
         pressed = fresh;
+    }
+    if (pressed & 0x1000) g_acceptMs = GetTickCount64();
+    if (g_gfxOpen)
+    {
+        if (pressed & (0x2000 | 0x0010 | 0x0020)) { NbashGfxMenuToggle(); return true; }      // B, Start or Back closes
+        if ((pressed & (0x0100 | 0x0200)) && NbashCamAvailable()) { g_gfxOpen = false; g_camSel = NbashCamGet(); g_camOpen = true; g_version++; return true; }
+        if (pressed & 0x0001) { g_gfxSel = (g_gfxSel.load() + kNbashGfxRows - 1) % kNbashGfxRows; g_version++; }
+        if (pressed & 0x0002) { g_gfxSel = (g_gfxSel.load() + 1) % kNbashGfxRows; g_version++; }
+        if (pressed & 0x0004) { NbashGfxStep(g_gfxSel.load(), -1); g_version++; }
+        if (pressed & 0x0008) { NbashGfxStep(g_gfxSel.load(), +1); g_version++; }      // right = next value (A does nothing: the panel is opened with A from the game's Options row)
+        return true;
+    }
+    if (g_camOpen)
+    {
+        if (pressed & (0x0100 | 0x0200)) { g_camOpen = false; g_gfxOpen = true; g_version++; return true; }      // LB / RB: graphics page
+        if (pressed & 0x0020) { NbashCamMenuToggle(); return true; }
+        if (pressed & (0x1000 | 0x2000 | 0x0010)) NbashCamMenuToggle();        // A, B or Start closes
+        if (pressed & 0x0001) NbashCamMenuMove(-1);
+        if (pressed & 0x0002) NbashCamMenuMove(+1);
+        return true;
     }
     if (!g_open)
     {
-        if (!inMatch && (pressed & 0x0100)) { Load(); g_open = true; g_version++; Log("[stats] opened\n"); return true; }
+        // (14 Nov: the pad's Back button no longer opens the graphics overlay - the user wants these settings inside the game's own Options screen; F1 only)
+        if (false && !inMatch && (pressed & 0x0020)) { NbashGfxMenuToggle(); return true; }      // pad Back button (keyboard: Backspace) in the menus: graphics options. In a match Back stays the game's own (camera); there use F1
+        // 15 Nov: opens ONLY on the Select Team & Players screen while a player is hovered (selecthover.cpp), on that player
+        void NbashSelectInput(uint16_t); int NbashSelectHovered(std::vector<uint32_t>*, int*);
+        if (!inMatch && (pressed & 0x0100))
+        {
+            std::vector<uint32_t> ids; int idx = 0; int hov = NbashSelectHovered(&ids, &idx);
+            { static int n = 0; if (n++ < 200) Log("[stats] LB in the menus: hovered player id %d (cursor %d of %d)\n", hov, idx, int(ids.size())); }
+            if (hov >= 0)
+            {
+                Load(); std::lock_guard lk(g_mx); g_focus.clear(); g_focusTeam.clear();
+                for (size_t i = 0; i < g_players.size(); i++) if (g_players[i].id == hov) { g_focus.push_back(int(i)); break; }      // 16:22: that player ONLY
+                if (!g_focus.empty())
+                {
+                    int pi = -1; for (size_t i = 0; i < g_players.size(); i++) if (g_players[i].id == hov) pi = int(i);
+                    g_slot = 0; for (size_t k = 0; k < g_focus.size(); k++) if (g_focus[k] == pi) g_slot = int(k);
+                    for (auto& tm : g_teams) for (int q : tm.players) if (q == pi) g_focusTeam = tm.city + " " + tm.name;
+                    g_open = true; g_version++; Log("[stats] opened on the hovered player (id %d)\n", hov); return true;
+                }
+            }
+            return false;
+        }
+        if (!inMatch) NbashSelectInput(pressed);
         return false;
     }
-    if (pressed & (0x0100 | 0x2000)) { g_open = false; Log("[stats] closed\n"); return true; }
+    if ((pressed & 0x0100) || (g_focus.empty() && (pressed & 0x2000))) { g_open = false; Log("[stats] closed\n"); return true; }      // from the select screen only LB closes (B also reached the game there and sent it back to the team card)
+    if (!g_focus.empty())      // opened from the select screen: that player only, no paging; left / right change his shoes too (like X / Y)
+    {
+        if (pressed & 0x0008) pressed |= 0x4000;
+        if (pressed & 0x0004) pressed |= 0x8000;
+        pressed &= uint16_t(~(0x0001 | 0x0002 | 0x0004 | 0x0008));
+    }
+    if (pressed & (0x4000 | 0x8000))      // X = next shoe, Y = previous (shoes.cpp)
+    {
+        void NbashShoeStep(uint32_t, int);
+        std::string f, l; uint32_t ch = 0;
+        {
+            std::lock_guard lk(g_mx);
+            Team ft; if (!g_focus.empty()) ft.players = g_focus;
+            if (!g_teams.empty())
+            {
+                const Team& t = !g_focus.empty() ? ft : g_teams[size_t(((g_team % int(g_teams.size())) + int(g_teams.size())) % int(g_teams.size()))];
+                const Player& p = g_players[size_t(t.players[size_t(((g_slot % int(t.players.size())) + int(t.players.size())) % int(t.players.size()))])];
+                f = p.first; l = p.last; ch = p.chash;
+            }
+        }
+        if (ch) NbashShoeStep(ch, (pressed & 0x4000) ? +1 : -1);
+        g_version++;
+    }
     if (pressed & 0x0004) { g_slot--; g_version++; }
     if (pressed & 0x0008) { g_slot++; g_version++; }
     if (pressed & 0x0001) { g_team--; g_slot = 0; g_version++; }
@@ -235,12 +381,12 @@ bool NbashStatsInput(uint16_t pressed, bool inMatch)
 // called by the renderer after the game picture is drawn into the window's viewport
 void NbashStatsDraw(ID3D11Device* dev, ID3D11DeviceContext* ctx)
 {
-    if (!g_open) return;
+    if (!g_open && !g_camOpen && !g_gfxOpen) return;
     if (!g_vs)
     {
         ID3DBlob* vb = NbashCompileShader(kSrc, "stats_vs", "vs_5_0", "vs_main");
         ID3DBlob* pb = NbashCompileShader(kSrc, "stats_ps", "ps_5_0", "ps_main");
-        if (!vb || !pb) { Log("[stats] shader compile failed\n"); g_open = false; return; }
+        if (!vb || !pb) { Log("[stats] shader compile failed\n"); g_open = false; g_camOpen = false; g_gfxOpen = false; return; }
         dev->CreateVertexShader(vb->GetBufferPointer(), vb->GetBufferSize(), nullptr, &g_vs);
         dev->CreatePixelShader(pb->GetBufferPointer(), pb->GetBufferSize(), nullptr, &g_ps);
         D3D11_TEXTURE2D_DESC td{}; td.Width = W; td.Height = H; td.MipLevels = 1; td.ArraySize = 1; td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;

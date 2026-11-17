@@ -50,6 +50,23 @@ namespace
     // Y-trick modifier for right-stick moves: hold turbo (RT, default) or LT (NBASH_YMOD=lt)
     bool YModIsLT() { static const bool lt = getenv("NBASH_YMOD") && !strcmp(getenv("NBASH_YMOD"), "lt"); return lt; }
     bool YMod(const Pad& p) { return YModIsLT() ? p.lt > 100 : p.rt > 100; }
+}
+// 16 Nov: controller layout. "new" (default) = the custom layout below; "original" = the game's own controls, nothing remapped.
+// Chosen by NBASH_LAYOUT=new|original, else by the first word of nbash_controls.txt next to the game program.
+bool NbashOriginalLayout()
+{
+    static int v = -1;
+    if (v < 0)
+    {
+        const char* e = getenv("NBASH_LAYOUT"); char buf[32] = {};
+        if (!e) { if (FILE* f = fopen("nbash_controls.txt", "r")) { if (fscanf(f, "%31s", buf) != 1) buf[0] = 0; fclose(f); e = buf; } }
+        v = (e && !strncmp(e, "orig", 4)) ? 1 : 0;
+        Log("[layout] controller layout: %s\n", v ? "ORIGINAL (the game's own buttons)" : "NEW (custom layout)");
+    }
+    return v == 1;
+}
+namespace
+{
     bool ReadKeyboard(Pad& p)
     {
         HWND w = NbashWindow();
@@ -200,6 +217,7 @@ IMPORT(XamInputGetState)
         if (std::abs(int(p.ly)) > 20000) b |= p.ly > 0 ? 0x0001 : 0x0002;
         uint16_t pressed = uint16_t(b & ~prevB); prevB = b;
         bool wasOpen = NbashStatsOpen();
+        if ((pressed & 0x000F) && !wasOpen && !NbashInMatch()) NbashMenuMove();   // menu probe: the menus read moves here
         if ((pressed && NbashStatsInput(pressed, NbashInMatch())) || wasOpen || NbashStatsOpen()) p = Pad{};
     }
     // Optional control scheme (NBASH_RSTICK=dribble, "Play (right stick dribble).bat"):
@@ -213,11 +231,11 @@ IMPORT(XamInputGetState)
     //                                                   NBASH_RS_HOLDMS ms (default 600)
     // The stick must come back near the middle before the next move. It is not passed to the game.
     {
-        static const bool rsDribble = !(getenv("NBASH_RSTICK") && !strcmp(getenv("NBASH_RSTICK"), "off"));   // your custom scheme is the default
+        static const bool rsDribble = !NbashOriginalLayout() && !(getenv("NBASH_RSTICK") && !strcmp(getenv("NBASH_RSTICK"), "off"));   // your custom scheme is the default
         extern bool NbashInMatch();
         if (rsDribble && NbashInMatch())   // menus keep the normal buttons (A forward, B back)
         {
-            static const int holdMs = getenv("NBASH_RS_HOLDMS") ? atoi(getenv("NBASH_RS_HOLDMS")) : 600;
+            static const int holdMs = getenv("NBASH_RS_HOLDMS") ? atoi(getenv("NBASH_RS_HOLDMS")) : 120;   // 16 Nov: R3 = the X trick button (was a 600 ms spinstep); held = X held
             static const int bumperMs = getenv("NBASH_RS_BUMPERMS") ? atoi(getenv("NBASH_RS_BUMPERMS")) : 120;
             // buttons: on offense X shoots (sends B); on defense X is steal (stays X) and Y jumps (sends B)
             extern int NbashGameplayState(); extern int NbashHumanOnDefense();
@@ -267,12 +285,19 @@ IMPORT(XamInputGetState)
                 {
                     auto t = std::chrono::steady_clock::now();
                     static bool r3Was[4];
-                    if (r3 && !r3Was[user]) { r3Until[user] = t + std::chrono::milliseconds(holdMs); r3Tb[user] = YMod(p) ? 0x8000 : 0x4000; Log("[move] t=%llu ms pad%u R3 spinstep\n", (unsigned long long)NbashMs(), user + 1); }
+                    if (r3 && !r3Was[user]) { r3Until[user] = t + std::chrono::milliseconds(holdMs); r3Tb[user] = YMod(p) ? 0x8000 : 0x4000; Log("[move] t=%llu ms pad%u R3 spinstep\n", (unsigned long long)NbashMs(), user + 1); { extern void NbashTrickMark(const char*); NbashTrickMark("R3 spinstep"); } }
                     if (r3 && t + std::chrono::milliseconds(30) > r3Until[user] && r3Was[user]) r3Until[user] = t + std::chrono::milliseconds(30);
                     r3Was[user] = r3;
                 }
+                // 16 Nov: WITHOUT the ball on offense, Y = jump (the game's B), like on defense
+                extern int NbashUserHasBall();
+                int hb = NbashUserHasBall(); bool hasBall = hb >= 0 ? hb == 1 : NbashGameplayState() == 3;
+                bool yJump = !hasBall && (p.buttons & 0x8000);
+                if (yJump) p.buttons &= ~0x8000;
+                { static bool lastHb = true; if (hasBall != lastHb) { lastHb = hasBall; Log("[layout] t=%llu offense %s\n", (unsigned long long)NbashMs(), hasBall ? "WITH the ball: Y off the heezy, B pick" : "without the ball: Y jump, B pick"); } }
                 if (p.buttons & 0x2000) { p.buttons &= ~0x2000; p.buttons |= 0x0080; }
                 if (p.buttons & 0x4000) { p.buttons &= ~0x4000; p.buttons |= 0x2000; }
+                if (yJump) p.buttons |= 0x2000;
                 // Y = off the heezy. The game does it for a Y tap with the left stick idle (defender in
                 // front), so: left stick held idle from the press, Y sent NBASH_HEEZY_PRE ms later (150),
                 // stick kept idle NBASH_HEEZY_POST ms more (250).
@@ -283,7 +308,14 @@ IMPORT(XamInputGetState)
                     auto t = std::chrono::steady_clock::now();
                     bool y = (p.buttons & 0x8000) != 0 && !YMod(p);   // (modifier + stick moves send Y themselves)
                     if (y) p.buttons &= ~0x8000;
-                    if (y && !yWas[user]) { hStart[user] = t; hActive[user] = true; Log("[move] t=%llu ms pad%u Y: off the heezy\n", (unsigned long long)NbashMs(), user + 1); }
+                    if (y && !yWas[user])
+                    {
+                        // 16 Nov: only with a defender close (NBASH_HEEZY_DIST m, default 2.0); otherwise Y does nothing (the game would do another trick)
+                        static const float hzDist = getenv("NBASH_HEEZY_DIST") ? float(atof(getenv("NBASH_HEEZY_DIST"))) : 2.0f;
+                        extern float NbashOppDist(); float od = NbashOppDist();
+                        if (od >= 0 && od > hzDist) Log("[move] t=%llu ms pad%u Y: nobody within %.1f m (nearest %.1f m) - no trick\n", (unsigned long long)NbashMs(), user + 1, hzDist, od);
+                        else { hStart[user] = t; hActive[user] = true; Log("[move] t=%llu ms pad%u Y: off the heezy (defender %.1f m)\n", (unsigned long long)NbashMs(), user + 1, od); }
+                    }
                     yWas[user] = y;
                     if (hActive[user])
                     {
@@ -300,21 +332,22 @@ IMPORT(XamInputGetState)
                     if (r3Tb[user] == 0x8000 && YModIsLT()) p.lt = 0;   // LT was our modifier
                 }
             }
-            enum State { Idle, Down, Up, WaitCentre, SideHold };
+            enum State { Idle, Down, Up, WaitCentre, SideHold, DownSide, UpSide, RtDown, RtDownSide };
             // hold LT: the stick moves use the Y trick button instead of X (LT itself is hidden from the
             // game while a stick move runs)
             const uint16_t tb = YMod(p) ? 0x8000 : 0x4000;
             static uint16_t gestureTb[4] = { 0x4000, 0x4000, 0x4000, 0x4000 };
             // held up / down: keep dribbling like mashing X -- a tap every NBASH_DRIBBLE_MS (160)
             static const int dribbleMs = getenv("NBASH_DRIBBLE_MS") ? atoi(getenv("NBASH_DRIBBLE_MS")) : 160;
-            static std::chrono::steady_clock::time_point sideT[4], moveUntil[4];
+            static std::chrono::steady_clock::time_point sideT[4], moveUntil[4], stdUntil[4];   // stdUntil: left stick hidden so the game picks the STANDING trick slot
             static int moveDir[4];
             static const int moveDribbleMs = getenv("NBASH_MOVEDRIBBLE_MS") ? atoi(getenv("NBASH_MOVEDRIBBLE_MS")) : 0;   // off: crossovers stay in place
             static State st[4] = {};
+            static int lastTrick[4] = {};      // signature moves: 1 kick (LB+Y), 2 plain Y, 3 heel (RB+Y) - the game skips its trick sound for the same trick twice
             static std::chrono::steady_clock::time_point xUntil[4], bumpUntil[4];
             static uint16_t bump[4];
             static std::chrono::steady_clock::time_point tapFrom[4];   // X of a bumper move starts here
-            static std::chrono::steady_clock::time_point noTbUntil[4]; // trick buttons forced up until here
+            static std::chrono::steady_clock::time_point noTbUntil[4]; static std::chrono::steady_clock::time_point sigRtOff[4]; // trick buttons forced up until here static std::chrono::steady_clock::time_point sigRtOff[4];
             auto now = std::chrono::steady_clock::now();
             int rx = p.rx, ry = p.ry;                       // ry > 0 = up, < 0 = down
             int64_t mag2 = int64_t(rx) * rx + int64_t(ry) * ry;
@@ -325,12 +358,69 @@ IMPORT(XamInputGetState)
             bool down = pushed && ry < 0 && -ry * 10 >= std::abs(rx) * 6, up = pushed && ry > 0 && ry * 10 >= std::abs(rx) * 6;
             bool sideways = pushed && !down && !up;
             bool rotated = std::abs(rx) > 12000 && std::abs(rx) > std::abs(ry);
+            // 14 Nov 17:45: Edwards' extra 2K moves on half circles of the right stick (behind-the-back: top -> side -> bottom; spin: bottom -> side -> top).
+            // Same game trick slots as the crossover (both end with the ball in the other hand), alternating LB + Y / plain Y for the trick sound.
+            auto fireSig = [&](int variant, const char* what) -> bool
+            {
+                extern int NbashSigDribble(int); if (!NbashSigDribble(variant)) return false;
+                // 14 Nov 19:55 (tricks while moving): moving, the game uses its MOVE_FWD trick slots, where the tricks that end in the OTHER hand are SLAP (Y)
+                // and HEEL_FLIP (RB + Y); standing (STD) they are KICK_FLIP (LB + Y) and SLAP (Y).  Alternating = a new trick every time = trick sound.
+                const bool moving = int64_t(p.lx) * p.lx + int64_t(p.ly) * p.ly > 9000ll * 9000ll;
+                int t; if (moving) { t = lastTrick[user] == 2 ? 3 : 2; bump[user] = t == 3 ? 0x0200 : 0; } else { t = lastTrick[user] == 1 ? 2 : 1; bump[user] = t == 1 ? 0x0100 : 0; }
+                lastTrick[user] = t;
+                gestureTb[user] = 0x8000; bumpUntil[user] = now + std::chrono::milliseconds(300); tapFrom[user] = now + std::chrono::milliseconds(60);
+                xUntil[user] = tapFrom[user] + std::chrono::milliseconds(120); noTbUntil[user] = tapFrom[user]; sigRtOff[user] = now + std::chrono::milliseconds(350); st[user] = WaitCentre;
+                Log("[move] t=%llu ms pad%u signature dribble (%s%s) - %s\n", (unsigned long long)NbashMs(), user + 1, what, moving ? ", moving" : "", t == 1 ? "LB + Y" : t == 3 ? "RB + Y" : "Y");
+                { extern void NbashTrickMark(const char*); NbashTrickMark("signature"); }
+                return true;
+            };
+            auto fireHes = [&]() -> bool      // 14 Nov 19:25: RT + up = Edwards' 2K14 hesitation in the heel slot (RB + Y; ends in the start hand)
+            {
+                extern int NbashSigDribble(int); if (!NbashSigDribble(2)) return false;
+                // standing: HEEL_FLIP (RB + Y) ends in the start hand; moving: the MOVE_FWD trick that does is HEEL_KICK (LB + Y)
+                const bool moving = int64_t(p.lx) * p.lx + int64_t(p.ly) * p.ly > 9000ll * 9000ll;
+                lastTrick[user] = moving ? 1 : 3; bump[user] = moving ? 0x0100 : 0x0200;
+                gestureTb[user] = 0x8000; bumpUntil[user] = now + std::chrono::milliseconds(300); tapFrom[user] = now + std::chrono::milliseconds(60);
+                xUntil[user] = tapFrom[user] + std::chrono::milliseconds(120); noTbUntil[user] = tapFrom[user]; sigRtOff[user] = now + std::chrono::milliseconds(350); st[user] = WaitCentre;
+                Log("[move] t=%llu ms pad%u signature dribble (RT hesitation%s) - %s + Y\n", (unsigned long long)NbashMs(), user + 1, moving ? ", moving" : "", moving ? "LB" : "RB");
+                { extern void NbashTrickMark(const char*); NbashTrickMark("signature"); }
+                return true;
+            };
+            auto downRotate = [&]()      // the original quarter circle from below (unchanged)
+            {
+                bump[user] = rx < 0 ? 0x0100 : 0x0200; gestureTb[user] = tb;
+                bumpUntil[user] = now + std::chrono::milliseconds(300); tapFrom[user] = now + std::chrono::milliseconds(80); xUntil[user] = now + std::chrono::milliseconds(200);
+                noTbUntil[user] = tapFrom[user]; st[user] = WaitCentre;
+                Log("[move] t=%llu ms pad%u down+rotate %s: %s + X\n", (unsigned long long)NbashMs(), user + 1, rx < 0 ? "left" : "right", rx < 0 ? "LB" : "RB"); { extern void NbashTrickMark(const char*); NbashTrickMark("down+rotate"); }
+            };
+            auto upRotate = [&]()      // the original quarter circle from above (unchanged)
+            {
+                bump[user] = 0x0300; gestureTb[user] = tb; bumpUntil[user] = now + std::chrono::milliseconds(300);
+                tapFrom[user] = now + std::chrono::milliseconds(80); xUntil[user] = now + std::chrono::milliseconds(200); noTbUntil[user] = tapFrom[user]; st[user] = WaitCentre;
+                Log("[move] t=%llu ms pad%u up+rotate: LB + RB + %s\n", (unsigned long long)NbashMs(), user + 1, tb == 0x8000 ? "Y" : "X"); { extern void NbashTrickMark(const char*); NbashTrickMark("up+rotate"); }
+            };
+            extern bool NbashSigHasMove(int);
             if (defense) st[user] = WaitCentre;   // on defense the stick does no dribble moves
             else switch (st[user])
             {
             case Idle:
-                if (tb == 0x8000 && pushed)
+                // 14 Nov 19:30: WITHOUT RT the right stick is the old X layout again (plain flick = X crossover, held up / down = X dribbles,
+                // quarter circles = LB / RB + X).  The old non-RT half circles (behind-the-back / spin) are gone.
+                // WITH RT = Edwards' 2K14 moves (traced from 2K14, AnimTrace run 4):
+                //   RT + sideways = crossover (kick / slap slots, alternating = trick sound every time)
+                //   RT + down     = behind-the-back (kick / slap _bhb)      RT + down -> side -> up (half circle) = spin (kick / slap _spin)
+                //   RT + up       = hesitation (heel slot: ends in the start hand, RB + Y)
+                // LT + stick (Y tricks) is unchanged.  A player without these clips: RT + stick falls through to the X layout.
+                if (pushed && p.rt > 100 && !(YModIsLT() && p.lt > 100) && NbashSigHasMove(3))
                 {
+                    Log("[rstick] t=%llu ms pad%u RT %d + %s\n", (unsigned long long)NbashMs(), user + 1, p.rt, sideways ? (rx < 0 ? "left" : "right") : up ? "up" : "down");
+                    if (sideways) { if (!fireSig(1, "RT crossover")) st[user] = WaitCentre; }
+                    else if (up) { if (!fireHes()) st[user] = WaitCentre; }
+                    else if (down) { st[user] = RtDown; sideT[user] = now; }      // behind-the-back, or the start of the spin's half circle
+                }
+                else if (tb == 0x8000 && pushed)
+                {
+                    { extern int NbashSigDribble(int); NbashSigDribble(0); }      // the game's own Y tricks: stock clips
                     // LT held: simple Y moves -- up = Y, left = LB + Y, right = RB + Y, down = LB + RB + Y
                     bump[user] = up ? 0 : down ? 0x0300 : rx < 0 ? 0x0100 : 0x0200;
                     gestureTb[user] = 0x8000;
@@ -340,58 +430,57 @@ IMPORT(XamInputGetState)
                     noTbUntil[user] = tapFrom[user];
                     st[user] = WaitCentre;
                     Log("[move] t=%llu ms pad%u LT+%s: %sY\n", (unsigned long long)NbashMs(), user + 1, up ? "up" : down ? "down" : rx < 0 ? "left" : "right",
-                        up ? "" : down ? "LB + RB + " : rx < 0 ? "LB + " : "RB + ");
+                        up ? "" : down ? "LB + RB + " : rx < 0 ? "LB + " : "RB + "); { extern void NbashTrickMark(const char*); NbashTrickMark("LT+"); }
                 }
-                else if (down) { st[user] = Down; sideT[user] = now; }
+                else if (down)
+                {
+                    // 14 Nov 19:33: a quick FLICK down = one back dribble (RB + X) even when the stick is back in the middle before the first held-down
+                    // tap would come (40 ms); holding down keeps dribbling as before.
+                    st[user] = Down; sideT[user] = now;
+                    bump[user] = 0x0200; gestureTb[user] = tb; bumpUntil[user] = now + std::chrono::milliseconds(220);
+                    tapFrom[user] = now + std::chrono::milliseconds(40); xUntil[user] = now + std::chrono::milliseconds(160); noTbUntil[user] = now;
+                    Log("[move] t=%llu ms pad%u flick down: back dribble (RB + %s)\n", (unsigned long long)NbashMs(), user + 1, tb == 0x8000 ? "Y" : "X");
+                }
                 else if (up) { st[user] = Up; sideT[user] = now; }
                 else if (sideways)
                 {
                     p.buttons |= tb; gestureTb[user] = tb; st[user] = WaitCentre;
-                    // moving crossover: if the left stick is idle, push it to that side briefly so the
-                    // game uses its moving dribble move (NBASH_MOVEDRIBBLE_MS, default 250; 0 = off)
                     int64_t lmag2 = int64_t(p.lx) * p.lx + int64_t(p.ly) * p.ly;
                     if (moveDribbleMs > 0 && lmag2 < 9000ll * 9000ll) { moveUntil[user] = now + std::chrono::milliseconds(moveDribbleMs); moveDir[user] = rx > 0 ? 1 : -1; }
-                    Log("[move] t=%llu ms pad%u crossover\n", (unsigned long long)NbashMs(), user + 1);
+                    Log("[move] t=%llu ms pad%u crossover\n", (unsigned long long)NbashMs(), user + 1); { extern void NbashTrickMark(const char*); NbashTrickMark("crossover"); }
                     { extern void NbashProbeCrossover(); if (user == 0) NbashProbeCrossover(); }
                 }
                 break;
             case Up:     // held up: front dribble (X tapped repeatedly); up then rotate = LB + RB + X
                 if (centred) st[user] = Idle;
-                else if (rotated)
-                {
-                    bump[user] = 0x0300; gestureTb[user] = tb;
-                    bumpUntil[user] = now + std::chrono::milliseconds(300);
-                    tapFrom[user] = now + std::chrono::milliseconds(80);    // a clear gap after any dribble press,
-                    xUntil[user] = now + std::chrono::milliseconds(200);    // so the game sees a fresh press
-                    noTbUntil[user] = tapFrom[user];
-                    st[user] = WaitCentre;
-                    Log("[move] t=%llu ms pad%u up+rotate: LB + RB + %s\n", (unsigned long long)NbashMs(), user + 1, tb == 0x8000 ? "Y" : "X");
-                }
+                else if (rotated) upRotate();
                 else if (dribbleMs > 0)
                 {
                     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - sideT[user]).count();
                     if (ms % dribbleMs < dribbleMs / 2) p.buttons |= tb;
                 }
                 break;
-            case Down:   // held down: behind-the-back dribble (RB held, X tapped repeatedly)
+            case Down:   // held down: behind-the-back dribble (RB held, X tapped repeatedly); down then rotate = LB / RB + X
                 if (centred) st[user] = Idle;
-                else if (rotated)
-                {
-                    // down then rotate: left = LB + X, right = RB + X (bumper first, then the X tap)
-                    bump[user] = rx < 0 ? 0x0100 : 0x0200; gestureTb[user] = tb;
-                    bumpUntil[user] = now + std::chrono::milliseconds(300);
-                    tapFrom[user] = now + std::chrono::milliseconds(80);    // a clear gap after any dribble press,
-                    xUntil[user] = now + std::chrono::milliseconds(200);    // so the game sees a fresh press
-                    noTbUntil[user] = tapFrom[user];
-                    st[user] = WaitCentre;
-                    Log("[move] t=%llu ms pad%u down+rotate %s: %s + X\n", (unsigned long long)NbashMs(), user + 1, rx < 0 ? "left" : "right", rx < 0 ? "LB" : "RB");
-                }
+                else if (rotated) downRotate();
                 else
                 {
                     p.buttons |= 0x0200;
                     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - sideT[user]).count();
                     if (dribbleMs > 0 && ms >= 40 && (ms - 40) % dribbleMs < dribbleMs / 2) p.buttons |= tb;   // RB first, then X
                 }
+                break;
+            case RtDown:   // RT + down: let go / stay down = behind-the-back; round a side = maybe the spin
+                if (rotated) { st[user] = RtDownSide; sideT[user] = now; }
+                else if (centred || now - sideT[user] > std::chrono::milliseconds(200)) { if (!fireSig(3, "RT behind-the-back")) st[user] = centred ? Idle : WaitCentre; }
+                break;
+            case RtDownSide:    // came from the bottom round a side: reaching the top = spin; otherwise behind-the-back
+                if (up) { if (!fireSig(4, "RT spin")) st[user] = WaitCentre; }
+                else if (centred || now - sideT[user] > std::chrono::milliseconds(350)) { if (!fireSig(3, "RT behind-the-back")) st[user] = centred ? Idle : WaitCentre; }
+                break;
+            case UpSide:
+            case DownSide:
+                st[user] = centred ? Idle : WaitCentre;
                 break;
             case SideHold:
             case WaitCentre:
@@ -406,6 +495,7 @@ IMPORT(XamInputGetState)
                 else moveUntil[user] = now;                                                        // player took over
             }
             if (now < noTbUntil[user]) p.buttons &= ~(0x4000 | 0x8000);
+            if (now < sigRtOff[user]) p.rt = 0;      // signature dribble with turbo: the game must see a plain Y trick
             if (now < xUntil[user] && now >= tapFrom[user]) p.buttons |= gestureTb[user];
             if (now < bumpUntil[user] && now >= tapFrom[user]) p.buttons |= bump[user];   // bumper together with the trick button
             p.lt = 0;   // in this layout LT is only the Y-trick switch: the game never sees it (no walking)
@@ -415,7 +505,7 @@ IMPORT(XamInputGetState)
     // Analog walk: a light push of the left stick walks (the game's LT walk), a full push runs.
     // NBASH_WALK=0 turns it off; NBASH_WALK_PCT sets the walk/run boundary (% of full tilt, default 70).
     {
-        static const bool walkOn = !(getenv("NBASH_WALK") && getenv("NBASH_WALK")[0] == '0');
+        static const bool walkOn = !NbashOriginalLayout() && getenv("NBASH_WALK") && getenv("NBASH_WALK")[0] == '1';   // 16 Nov: off unless NBASH_WALK=1 (user: take the walk off the left stick)
         static const int walkPct = getenv("NBASH_WALK_PCT") ? atoi(getenv("NBASH_WALK_PCT")) : 70;
         if (walkOn && p.rt <= 100)   // turbo always runs
         {
@@ -471,12 +561,14 @@ IMPORT(XamInputGetState)
     // dunk only with turbo: a dunk started without turbo becomes a layup (quick tap) -- gameplay.cpp
     if (user == 0)
     {
-        static const bool turboDunk = !(getenv("NBASH_TURBODUNK") && getenv("NBASH_TURBODUNK")[0] == '0');
+        static const bool turboDunk = !NbashOriginalLayout() && !(getenv("NBASH_TURBODUNK") && getenv("NBASH_TURBODUNK")[0] == '0');
         static const int layupMs = getenv("NBASH_LAYUP_MS") ? atoi(getenv("NBASH_LAYUP_MS")) : 70;
         // with turbo: a dunk always stays a dunk -- a quick tap would be the game's layup, so the
         // shoot press is held for the game for at least NBASH_DUNK_MS (default 250 ms)
         static const int dunkMs = getenv("NBASH_DUNK_MS") ? atoi(getenv("NBASH_DUNK_MS")) : 250;
         static uint64_t pressT = 0, holdUntil = 0; static uint64_t g_dunkStyleUntil = 0; static bool master = true;
+        static uint64_t autoUpAt = 0, autoArmAt = 0; static uint32_t autoArm = 0; static bool autoOn = false, autoSaid = false;      // 12 Nov 23:55: 2K-style shot button for the custom players (see below)
+        const bool physShoot = (p.buttons & 0x2000) != 0;
         static const char* kClass[3] = { "SigSIM_Class_SmallMan", "SigSIM_Class_HighFlyer", "SigSIM_Class_BigMan" };
         static const char* kType[3] = { "SigSIM_DunkType_Rotating", "SigSIM_DunkType_Signature", "SigSIM_DunkType_Windmill" };
         static int anyClass = -1, anyType = 0; static float origClass[3], origType[3]; static uint64_t anyUntil = 0; static uint64_t g_probeAt1 = 0, g_probeAt2 = 0, g_probeAt3 = 0; static bool noTurbo = false, cut = false;
@@ -493,6 +585,16 @@ IMPORT(XamInputGetState)
               if (g_probeAt1 && now >= g_probeAt1) { g_probeAt1 = 0; NbashDumpSignals("+250ms"); }
               if (g_probeAt2 && now >= g_probeAt2) { g_probeAt2 = 0; NbashDumpSignals("+700ms"); g_probeAt3 = now + 800; }
               if (g_probeAt3 && now >= g_probeAt3) { g_probeAt3 = 0; NbashDumpSignals("+1500ms"); } }
+            // NBASH_SHOTTEST=1: forces the game's shot accuracy signal to almost nothing for 2.5 s after each
+            // shoot press, to check whether the signal decides makes and misses
+            static const bool shotTest = getenv("NBASH_SHOTTEST") && getenv("NBASH_SHOTTEST")[0] == '1';
+            static uint64_t shotForceUntil = 0; static bool shotLogged = false;
+            if (shotTest && now < shotForceUntil)
+            {
+                extern float NbashSetPlayerSignal(const char*, float);
+                float old = NbashSetPlayerSignal("SigSIM_ShotAccuracy", 0.05f); NbashSetPlayerSignal("SigSIM_ShotPower", 0.0285714f);
+                if (!shotLogged && old > 0.06f) { shotLogged = true; Log("[shottest] t=%llu game wanted accuracy %.2f, forced 0.05\n", (unsigned long long)now, old); }
+            }
             if (!cutChecked && now - cutT >= 250)
             {
                 cutChecked = true;
@@ -503,7 +605,8 @@ IMPORT(XamInputGetState)
             {
                 if (!pressT)
                 {
-                    pressT = now; noTurbo = p.rt <= 100; cut = false; holdUntil = 0;
+                    pressT = now; noTurbo = p.rt <= 100; cut = false; holdUntil = 0; { extern void NbashShotSlowPress(); NbashShotSlowPress(); }
+                    { extern uint32_t NbashShotAutoHoldMs(); uint32_t ah = (noTurbo && !autoOn) ? NbashShotAutoHoldMs() : 0; autoArm = ah; autoArmAt = now; } if (shotTest) { shotForceUntil = now + 2500; shotLogged = false; extern void NbashResolveSignalsByScan(); NbashResolveSignalsByScan(); }
                     { static const bool dp = getenv("NBASH_DUNKPROBE") != nullptr; extern void NbashDumpSignals(const char*); if (dp) { extern void NbashResolveSignalsByScan(); NbashResolveSignalsByScan(); NbashDumpSignals("press"); g_probeAt1 = now + 250; g_probeAt2 = now + 700; } }
                     // NBASH_STEALCAPTURE also saves frames on the first 4 shoot presses (to catch the
                     // dunk prompt icons, e.g. the "off someone's back" dunk)
@@ -596,9 +699,25 @@ IMPORT(XamInputGetState)
                     Log("[turbodunk] t=%llu turbo: quick tap held to %d ms so it stays a dunk\n", (unsigned long long)now, dunkMs);
                 }
                 if (holdUntil && now < holdUntil) p.buttons |= 0x2000;
-                else { pressT = 0; holdUntil = 0; }
+                else { if (pressT) { extern void NbashShotButtonUp(uint64_t); NbashShotButtonUp(now - pressT); } pressT = 0; holdUntil = 0; }
                 // keep the random dunk style held through the whole dunk (the game reads the bumpers
                 // while the dunk starts, not only on the shoot press)
+            }
+            // 2K-STYLE SHOT BUTTON (custom players' jump shots): Homecourt lets the ball go ~150 ms after the button comes UP, so its release depends on how long
+            // the button is held. For these players the game is shown a press of a fixed length instead - whatever the real button does (tap or hold) - so the ball
+            // leaves exactly at the release frame of their 2K animation. NBASH_SHOTAUTO=0 turns it off.
+            // 13 Nov 03:50, like 2K: a TAP (button up again within NBASH_TAP_MS, default 140 ms) is left to the game = pump fake; only a press that is still down after that
+            // becomes a shot with the fixed release.
+            if (autoArm && !autoOn)
+            {
+                static const uint64_t tapMs = getenv("NBASH_TAP_MS") ? uint64_t(atoi(getenv("NBASH_TAP_MS"))) : 140;
+                if (!physShoot) { static int n = 0; if (n++ < 40) Log("[shots] t=%llu tap (%llu ms): left to the game (pump fake)\n", (unsigned long long)now, (unsigned long long)(now - autoArmAt)); autoArm = 0; }
+                else if (now - autoArmAt >= tapMs) { autoOn = true; autoSaid = false; autoUpAt = autoArmAt + autoArm; static int n = 0; if (n++ < 60) Log("[shots] t=%llu held shoot press by a custom player: the game sees the button held for %u ms in all (2K-style release)\n", (unsigned long long)now, autoArm); autoArm = 0; }
+            }
+            if (autoOn)
+            {
+                if (now < autoUpAt) p.buttons |= 0x2000;
+                else { p.buttons &= ~0x2000; if (!autoSaid) { autoSaid = true; extern void NbashShotButtonUp(uint64_t); NbashShotButtonUp(1); } if (!physShoot) autoOn = false; }
             }
             // the random dunk style stays held for the whole dunk (0.9 s from the turbo shoot press),
             // even after the shoot button is let go

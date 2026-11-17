@@ -1,3 +1,6 @@
+#include <algorithm>
+#include <cmath>
+#include <chrono>
 // Direct3D 11 renderer for Xenos draws.
 //
 // First version: everything renders into one host render target the size of the screen
@@ -21,8 +24,10 @@
 #include <cstdio>
 #include <cstring>
 #include <memory>
+#include <thread>
 #include <string>
 #include <unordered_map>
+std::string GameRoot();      // main: the folder that holds data\ and mods\
 
 using namespace xe::gpu;
 
@@ -55,6 +60,12 @@ namespace
     IDXGISwapChain* g_swap = nullptr;
     ID3D11Texture2D* g_rt = nullptr;       // single-sample copy of the drawing surface (copies read this)
     ID3D11Texture2D* g_front = nullptr;    // last resolved frame (what gets presented)
+    // 14 Nov (GPU optimisation): the picture shown is read straight from the game's front-buffer copy target - no full-frame copies into g_front
+    // every frame any more (2 x 15 MB at 2560x1440 = ~3.5 GB/s of memory traffic, a lot for graphics that share the system memory).
+    // g_front is only filled when the game's front buffer is NOT a copy target (then the last full-frame copy is shown, as before).
+    ID3D11Texture2D* g_showTex = nullptr;          // what this frame shows (a copy target, or g_front)
+    ID3D11ShaderResourceView* g_showSrv = nullptr; // its view (nullptr = g_front's)
+    bool g_needFallback = true;                    // last Present did not find the front buffer -> keep g_front up to date
     ID3D11RenderTargetView* g_rtv = nullptr;   // the drawing surface (multisampled when g_msaa > 1)
     ID3D11Texture2D* g_ds = nullptr;
     ID3D11DepthStencilView* g_dsv = nullptr;
@@ -220,6 +231,7 @@ namespace
         uint64_t contentHash = 0;
         uint64_t checkedFrame = ~0ull;        // when the content was last re-checked
         uint32_t uploads = 0;
+        bool courtCube = false;               // 3D colour table that changes colours (a court's cc_*.f1), not the identity table
         uint32_t interval = 1;                // frames between re-checks: 1 while it keeps changing,
                                               // doubling up to 32 while it stays the same
         uint32_t width = 0, height = 0;
@@ -229,6 +241,8 @@ namespace
         ID3D11UnorderedAccessView* mipUav = nullptr;
     };
     uint64_t g_frame = 0;
+    uint64_t g_cleanCompFrame = ~0ull;      // last frame in which the game's final composite was replaced by the clean one (see CLEAN COMPOSITE)
+    uint64_t g_courtLutFrame = ~0ull;      // last frame in which a COURT colour cube (a 3D table that is not the identity) was used: only the courts have one, the menus do not
     int64_t g_hashTicks = 0; uint32_t g_hashCount = 0;
     int64_t g_dbgT[4];   // texture change checks (for the stats line)
     uint32_t g_textureUploads = 0;
@@ -317,6 +331,7 @@ namespace
                 if (created++ < 400)
                     Logf("[resolve] frame %llu: %s copy target %08X %ux%u (was %ux%u), source rect (%d,%d)-(%d,%d)\n", (unsigned long long)g_frame,
                          r.tex ? "re-creating" : "new", dest, w, h, r.w, r.h, sx0, sy0, sx1, sy1);
+                if (r.tex && r.tex == g_showTex) { g_showTex = nullptr; g_showSrv = nullptr; }      // (the shown picture is read from g_front then)
                 SafeRelease(r.srv); SafeRelease(r.tex);
                 D3D11_TEXTURE2D_DESC td{};
                 td.Width = w; td.Height = h; td.MipLevels = 1; td.ArraySize = 1; td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
@@ -514,6 +529,7 @@ namespace
         const uint8_t* src = PhysToHost(base);
 
         auto& ct = g_textures3D[KeyOf(f)];
+        if (ct.srv && ct.courtCube) g_courtLutFrame = g_frame;
         if (ct.srv && g_frame - ct.checkedFrame < ct.interval) return ct.srv;
         uint64_t hsh = 1469598103934665603ull;
         for (uint64_t i = 0; i + 8 <= span; i += (span > (1u << 20) ? (span / 65536) & ~7ull : 8)) { uint64_t v; memcpy(&v, src + i, 8); hsh = (hsh ^ v) * 1099511628211ull; }
@@ -551,6 +567,14 @@ namespace
         }
         g_ctx->UpdateSubresource(ct.tex3d, 0, nullptr, texels.data(), w * bpb, w * h * bpb);
         ct.contentHash = hsh;
+        if (bpb == 4 && w == 32 && h == 32 && d == 32)      // identity table: every channel averages 127.5 and has only the 32 grid values
+        {
+            double sum[3] = {}; bool seen[3][256] = {}; int kinds[3] = {};
+            for (size_t i = 0; i + 4 <= texels.size(); i += 4) for (int c = 0; c < 3; c++) { uint8_t v = texels[i + c]; sum[c] += v; if (!seen[c][v]) { seen[c][v] = true; kinds[c]++; } }
+            bool ident = true; for (int c = 0; c < 3; c++) if (fabs(sum[c] / 32768.0 - 127.5) > 1.0 || kinds[c] > 40) ident = false;
+            if (ct.courtCube != !ident) Logf("[render] colour cube at %08X: %s\n", base, ident ? "identity (menu)" : "court colours");
+            ct.courtCube = !ident; if (ct.courtCube) g_courtLutFrame = g_frame;
+        }
         return ct.srv;
     }
 
@@ -696,6 +720,86 @@ namespace
         WriteBmpFile(name, px, w, h);
     }
 
+    // ---------------------------------------------------------------- HD texture replacement
+    // game\mods\hd\<16 hex digits>.dds : an ordinary DDS (DXT1 / DXT3 / DXT5, with its mip chain, ANY size) that is shown instead of a game
+    // texture.  The name is the FNV-1a hash (8-byte words, little-endian) of the game texture's top-level block data once it is un-tiled and
+    // byte-swapped - which is byte for byte the top mip level of the PC-style DDS in the game's archives, so the names can be worked out
+    // offline (cloud meshtools/hdname.py).  The big picture lives only in the PC's video memory: nothing is added to the game's own
+    // (very tight) memory.  NBASH_HD=0 off;  NBASH_HDLOG=1 logs the hash of every block-compressed texture as it is first loaded.
+    uint64_t HdHash(const std::vector<uint8_t>& b)
+    {
+        uint64_t h = 1469598103934665603ull;
+        for (size_t i = 0; i + 8 <= b.size(); i += 8) { uint64_t v; memcpy(&v, &b[i], 8); h = (h ^ v) * 1099511628211ull; }
+        return h;
+    }
+    ID3D11ShaderResourceView* HdLookup(uint64_t hash)
+    {
+        static std::unordered_map<uint64_t, ID3D11ShaderResourceView*> loaded;      // nullptr = no file / failed
+        static std::unordered_map<uint64_t, std::string> files; static bool scanned = false;
+        struct PakEnt { uint64_t off; uint32_t size; }; static std::unordered_map<uint64_t, PakEnt> pak; static std::string pakPath;      // game\mods\hd.pak: ONE file with all HD textures ("NBHD", count, then hash / offset / size records, then the DDS files); loose files in mods\hd win over it
+        static const bool off = [] { const char* v = getenv("NBASH_HD"); return v && *v == '0'; }();
+        if (off) return nullptr;
+        if (!scanned)
+        {
+            scanned = true;
+            std::string dir = ::GameRoot() + "/mods/hd/"; WIN32_FIND_DATAA fd; HANDLE h = FindFirstFileA((dir + "????????????????.dds").c_str(), &fd);
+            if (h != INVALID_HANDLE_VALUE)
+            {
+                do { std::string fn = fd.cFileName; uint64_t k = strtoull(fn.substr(0, 16).c_str(), nullptr, 16); if (k) files[k] = dir + fn; } while (FindNextFileA(h, &fd));
+                FindClose(h);
+            }
+            pakPath = ::GameRoot() + "/mods/hd.pak";
+            if (FILE* pf = fopen(pakPath.c_str(), "rb"))
+            {
+                uint8_t hd[8]; uint32_t n = 0;
+                if (fread(hd, 1, 8, pf) == 8 && !memcmp(hd, "NBHD", 4)) { memcpy(&n, hd + 4, 4); if (n > 100000) n = 0; }
+                for (uint32_t i = 0; i < n; i++) { uint8_t r[24]; if (fread(r, 1, 24, pf) != 24) break; uint64_t k, o; uint32_t sz; memcpy(&k, r, 8); memcpy(&o, r + 8, 8); memcpy(&sz, r + 16, 4); pak[k] = { o, sz }; }
+                fclose(pf);
+            }
+            Logf("[hd] %u HD textures in mods\\hd.pak, %u loose files in mods\\hd\n", unsigned(pak.size()), unsigned(files.size()));
+        }
+        auto it = loaded.find(hash); if (it != loaded.end()) return it->second;
+        ID3D11ShaderResourceView* srv = nullptr;
+        auto f = files.find(hash); auto pk = pak.find(hash);
+        bool fromPak = f == files.end() && pk != pak.end();
+        char pakName[40]; snprintf(pakName, sizeof pakName, "hd.pak:%016llx", (unsigned long long)hash);
+        const std::string srcName = fromPak ? std::string(pakName) : (f != files.end() ? f->second : std::string());
+        if (f != files.end() || fromPak)
+        {
+            std::vector<uint8_t> d; FILE* fp = fopen(fromPak ? pakPath.c_str() : srcName.c_str(), "rb");
+            if (fp && fromPak) { _fseeki64(fp, (long long)pk->second.off, SEEK_SET); d.resize(pk->second.size); if (fread(d.data(), 1, d.size(), fp) != d.size()) d.clear(); fclose(fp); }
+            else if (fp) { fseek(fp, 0, SEEK_END); long n = ftell(fp); fseek(fp, 0, SEEK_SET); d.resize(size_t(n > 0 ? n : 0)); if (n <= 0 || fread(d.data(), 1, size_t(n), fp) != size_t(n)) d.clear(); fclose(fp); }
+            auto u32 = [&](size_t o) { uint32_t v; memcpy(&v, &d[o], 4); return v; };
+            if (d.size() > 128 && !memcmp(d.data(), "DDS ", 4))
+            {
+                uint32_t h = u32(12), w = u32(16), mips = u32(28) ? u32(28) : 1, cc = u32(84);
+                DXGI_FORMAT fmt = cc == 0x31545844 ? DXGI_FORMAT_BC1_UNORM : cc == 0x33545844 ? DXGI_FORMAT_BC2_UNORM : cc == 0x35545844 ? DXGI_FORMAT_BC3_UNORM : DXGI_FORMAT_UNKNOWN;
+                uint32_t blk = fmt == DXGI_FORMAT_BC1_UNORM ? 8 : 16;
+                if (fmt != DXGI_FORMAT_UNKNOWN && w && h && w <= 8192 && h <= 8192 && mips <= 14)
+                {
+                    std::vector<D3D11_SUBRESOURCE_DATA> init; size_t off = 128; uint32_t lw = w, lh = h; bool ok = true;
+                    for (uint32_t m = 0; m < mips; m++)
+                    {
+                        uint32_t bw = (lw + 3) / 4 ? (lw + 3) / 4 : 1, bh = (lh + 3) / 4 ? (lh + 3) / 4 : 1; size_t sz = size_t(bw) * bh * blk;
+                        if (off + sz > d.size()) { if (m == 0) ok = false; mips = m; break; }
+                        D3D11_SUBRESOURCE_DATA sd{}; sd.pSysMem = d.data() + off; sd.SysMemPitch = bw * blk; init.push_back(sd); off += sz;
+                        lw = lw > 1 ? lw / 2 : 1; lh = lh > 1 ? lh / 2 : 1;
+                    }
+                    if (ok && mips)
+                    {
+                        D3D11_TEXTURE2D_DESC td{}; td.Width = w; td.Height = h; td.MipLevels = mips; td.ArraySize = 1; td.Format = fmt; td.SampleDesc.Count = 1;
+                        td.Usage = D3D11_USAGE_IMMUTABLE; td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+                        ID3D11Texture2D* t = nullptr;
+                        if (SUCCEEDED(g_dev->CreateTexture2D(&td, init.data(), &t)) && t) { g_dev->CreateShaderResourceView(t, nullptr, &srv); t->Release(); }
+                    }
+                    Logf("[hd] %016llx: %s %ux%u, %u mips - %s\n", (unsigned long long)hash, srcName.c_str(), w, h, mips, srv ? "in use" : "could not be created");
+                }
+                else Logf("[hd] %s: not a DXT1 / DXT3 / DXT5 DDS - ignored\n", srcName.c_str());
+            }
+        }
+        loaded[hash] = srv; return srv;
+    }
+
     bool g_lastSwapRB = false;
     ID3D11ShaderResourceView* GetTexture(const xenos::xe_gpu_texture_fetch_t& f, float size[4])
     {
@@ -818,6 +922,18 @@ namespace
             rowPitch = bw * 4;
         }
 
+        if (fi.blockW > 1 && !fi.convertTo8888 && (fi.dxgi == DXGI_FORMAT_BC1_UNORM || fi.dxgi == DXGI_FORMAT_BC2_UNORM || fi.dxgi == DXGI_FORMAT_BC3_UNORM))
+        {
+            uint64_t bhash = HdHash(blocks);
+            static const bool hdLog = getenv("NBASH_HDLOG") != nullptr;
+            if ((hdLog || w >= 1024) && ct.uploads == 1) Logf("[hd] game texture %ux%u dxgi %u: %016llx\n", w, h, unsigned(fi.dxgi), (unsigned long long)bhash);
+            if (ID3D11ShaderResourceView* hd = HdLookup(bhash))
+            {
+                SafeRelease(ct.srv); SafeRelease(ct.tex); SafeRelease(ct.mipSrv); SafeRelease(ct.mipUav); SafeRelease(ct.mipTex);
+                hd->AddRef(); ct.srv = hd; ct.width = 0; ct.height = 0; ct.contentHash = hsh;      // width 0: a later change of the game texture builds a normal one again
+                return ct.srv;
+            }
+        }
         if (!ct.tex || ct.width != w || ct.height != h)
         {
             SafeRelease(ct.srv); SafeRelease(ct.tex);
@@ -1192,10 +1308,20 @@ bool Init(void* window, uint32_t width, uint32_t height)
         sd.BufferCount = 2;
         sd.OutputWindow = (HWND)window;
         sd.Windowed = TRUE;
-        sd.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;
+        // 14 Nov (GPU optimisation): FLIP model swap chain (Windows 10+). The old "blt" model made Windows copy every frame once more to put it on
+        // screen; flip hands the buffer over (and in full screen the display can scan it out directly). Falls back to the old model if refused.
+        sd.SwapEffect = getenv("NBASH_BLTSWAP") ? DXGI_SWAP_EFFECT_DISCARD : DXGI_SWAP_EFFECT_FLIP_DISCARD;
         IDXGIAdapter1* adapter = PickAdapter();
         hr = D3D11CreateDeviceAndSwapChain(adapter, adapter ? D3D_DRIVER_TYPE_UNKNOWN : D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, &want, 1,
                                            D3D11_SDK_VERSION, &sd, &g_swap, &g_dev, &got, &g_ctx);
+        if (FAILED(hr) && sd.SwapEffect == DXGI_SWAP_EFFECT_FLIP_DISCARD)
+        {
+            Logf("[render] flip-model swap chain refused (%08lX), using the old one\n", hr);
+            sd.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;
+            hr = D3D11CreateDeviceAndSwapChain(adapter, adapter ? D3D_DRIVER_TYPE_UNKNOWN : D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, &want, 1,
+                                               D3D11_SDK_VERSION, &sd, &g_swap, &g_dev, &got, &g_ctx);
+        }
+        else if (SUCCEEDED(hr)) Logf("[render] swap chain: %s\n", sd.SwapEffect == DXGI_SWAP_EFFECT_FLIP_DISCARD ? "flip model" : "blt model (NBASH_BLTSWAP)");
         if (FAILED(hr) && adapter)   // the chosen card refused: let Windows pick
         {
             Logf("[render] could not start on the chosen graphics card (%08lX), using the Windows default\n", hr);
@@ -1220,6 +1346,16 @@ bool Init(void* window, uint32_t width, uint32_t height)
             Logf("[render] graphics card: %s (%u MB)\n", name, unsigned(desc.DedicatedVideoMemory >> 20));
         }
         if (ad) ad->Release(); if (xd) xd->Release();
+    }
+    // 14 Nov (GPU optimisation): at most one frame queued ahead (less waiting in the driver, less lag) ...
+    { IDXGIDevice1* d1 = nullptr; if (SUCCEEDED(g_dev->QueryInterface(__uuidof(IDXGIDevice1), (void**)&d1))) { d1->SetMaximumFrameLatency(1); d1->Release(); } }
+    // ... and graphics built into the processor (shared system memory: AMD Radeon 7xxM / 8xxM, Intel) draw at 1.5x (1920x1080) by default instead of
+    // 2x (2560x1440); separate cards keep 2x. NBASH_RES_SCALE still decides when it is set.
+    {
+        D3D11_FEATURE_DATA_D3D11_OPTIONS2 o2{};
+        const bool uma = SUCCEEDED(g_dev->CheckFeatureSupport(D3D11_FEATURE_D3D11_OPTIONS2, &o2, sizeof o2)) && o2.UnifiedMemoryArchitecture;
+        if (uma && !getenv("NBASH_RES_SCALE")) { g_scale = 1.5f; g_rtW = Sc(int(width)); g_rtH = Sc(int(height)); }
+        Logf("[render] graphics memory: %s\n", uma ? "shared with the system (built-in graphics)" : "its own (separate card)");
     }
     if (!CreateTargets()) return false;
 
@@ -1264,7 +1400,7 @@ void Draw(const DrawCall& d)
         if (cc.copy_command != xenos::CopyCommand::kNull) Resolve(regs);
         // the "last finished picture" fallback for Present: only full-frame copies matter
         uint32_t pr = regs[XE_GPU_REG_RB_COPY_DEST_PITCH];
-        if ((pr & 0x3FFF) >= g_width && ((pr >> 16) & 0x3FFF) >= g_height) { SyncRt(); g_ctx->CopyResource(g_front, g_rt); }
+        if (g_needFallback && (pr & 0x3FFF) >= g_width && ((pr >> 16) & 0x3FFF) >= g_height) { SyncRt(); g_ctx->CopyResource(g_front, g_rt); }
         if (cc.color_clear_enable)
         {
             uint32_t c = regs[XE_GPU_REG_RB_COLOR_CLEAR];   // ARGB
@@ -1631,7 +1767,28 @@ void Draw(const DrawCall& d)
     static const uint64_t debugFrom = getenv("NBASH_RENDER_PSDEBUG_FROM") ? strtoull(getenv("NBASH_RENDER_PSDEBUG_FROM"), nullptr, 10) : 0;
     static const uint64_t debugTo = getenv("NBASH_RENDER_PSDEBUG_TO") ? strtoull(getenv("NBASH_RENDER_PSDEBUG_TO"), nullptr, 10) : ~0ull;
     bool useDebug = debugPs && g_drawCounter - 1 >= debugFrom && g_drawCounter - 1 <= debugTo;
-    g_ctx->PSSetShader(useDebug ? debugPs : ps->ps, nullptr, 0);
+    // CLEAN COMPOSITE (12 Nov): on a court the game's last full-screen pass (ps 14284948471810615086) lays the colour cube, a pink sky haze, bloom and a
+    // heavy vignette over a scene that is clean daylight before it (F12 captures: target 18003000 vs the finished frame).  While a court cube is bound,
+    // that pass is replaced by a plain copy of the scene texture (t0); the look is then added by the exe's own final pass (CourtLook).  NBASH_CLEANCOMP=0 off.
+    static const bool cleanOn = [] { const char* v = getenv("NBASH_CLEANCOMP"); return !(v && *v == '0'); }();
+    static ID3D11PixelShader* cleanPs = nullptr; static bool cleanTried = false;
+    bool cleanNow = cleanOn && !useDebug && d.psHash == 14284948471810615086ull && g_courtLutFrame == g_frame;
+    if (cleanNow && !cleanTried)
+    {
+        cleanTried = true;
+        std::string src = std::string(kCommonHlsl) + "Texture2D xt0 : register(t0); SamplerState xs0 : register(s0);\n"
+            "float4 main(XeVertexOut i) : SV_Target { return float4(xt0.Sample(xs0, i.t0.xy).rgb, 1); }";
+        if (ID3DBlob* b = Compile(src, "clean_composite_ps", "ps_5_0")) { g_dev->CreatePixelShader(b->GetBufferPointer(), b->GetBufferSize(), nullptr, &cleanPs); b->Release(); }
+        std::string note;
+        for (uint32_t tf = 0; tf < 6; tf++)
+        {
+            xenos::xe_gpu_texture_fetch_t f; memcpy(&f, &regs[0x4800 + tf * 6], sizeof(f)); if (uint32_t(f.type) != 2) continue;
+            char buf[64]; snprintf(buf, sizeof buf, " t%u %08X%s", tf, uint32_t(f.base_address) << 12, f.dimension == xenos::DataDimension::k3D ? "(3D)" : ""); note += buf;
+        }
+        Logf("[render] clean composite %s; the game's composite reads:%s\n", cleanPs ? "ON" : "could not be built", note.c_str());
+    }
+    if (cleanNow && cleanPs) g_cleanCompFrame = g_frame;
+    g_ctx->PSSetShader(useDebug ? debugPs : (cleanNow && cleanPs) ? cleanPs : ps->ps, nullptr, 0);
     g_ctx->VSSetShaderResources(0, kMaxTextures, srvs);
     g_ctx->VSSetShaderResources(16, 1, &g_vmemSrv);
     g_ctx->VSSetSamplers(0, kMaxTextures, samplers);
@@ -1759,7 +1916,7 @@ void CheckSceneBlack()
     D3D11_BOX box{ cx - 4, cy - 4, 0, cx + 4, cy + 4, 1 };
     g_ctx->CopySubresourceRegion(stage[slot][0], 0, 0, 0, 0, it->second.tex, 0, &box);
     D3D11_BOX box2{ g_rtW / 2 - 4, g_rtH / 2 - 4, 0, g_rtW / 2 + 4, g_rtH / 2 + 4, 1 };
-    g_ctx->CopySubresourceRegion(stage[slot][1], 0, 0, 0, 0, g_front, 0, &box2);
+    g_ctx->CopySubresourceRegion(stage[slot][1], 0, 0, 0, 0, g_showTex ? g_showTex : g_front, 0, &box2);
     stageFrame[slot] = g_frame;
 }
 
@@ -1782,8 +1939,31 @@ static void PresentScaled()
         std::string src = std::string(bilinear) + R"(
 Texture2D<float4> pic : register(t0); SamplerState lin : register(s0);
 cbuffer Grade : register(b0) { float4 g0; float4 g1; float4 g2; };   // g0: on, black, gamma, contrast  g1: sat, vibrance, highlights, white balance  g2: clarity, de-pink, -, -
+// COURT FRESH (g2.z, only while a court's colour cube is on screen - menus never get it): the game's old pink / violet / rose haze taken out of the picture
+float3 CourtFresh(float3 c)
+{
+    float k = g2.z;
+    float bl = saturate((c.b - max(c.r, c.g)) * 8);                          // violet -> clean blue: where blue leads, red goes under green
+    c.r = lerp(c.r, min(c.r, c.g * 0.90), bl * k);
+    float m = max(min(c.r, c.b) - c.g, 0) * k;                               // magenta / pink: red and blue both above green
+    c.r -= m; c.b -= m * 0.5; c.g += m * 0.15;
+    float l = dot(c, float3(0.2126, 0.7152, 0.0722)), mx = max(c.g, c.b);    // rose / salmon (red-led, blue close to green - so not skin, whose blue is well below green) -> neutral, at every brightness
+    float rose = saturate((l - 0.12) * 5) * saturate((c.r - mx) * 12) * saturate((c.b - c.g * 0.86) * 14) * k;
+    c.r = lerp(c.r, mx + (c.r - mx) * 0.12, rose);
+    // (the straw-grass -> green nudge and the raised black point of v2 are gone: with the clean cubes of 11 Nov the picture needs neither, and yellow jerseys must stay yellow)
+    return c;
+}
+// COURT LOOK (g2.z = 2): the picture arrives clean from the clean composite - only a light polish, no menu grade on top
+float3 CourtLook(float3 c)
+{
+    c = pow(saturate(c), 0.94); c += (c * c * (3 - 2 * c) - c) * 0.20;
+    float l = dot(c, float3(0.2126, 0.7152, 0.0722)); float sat = max(c.r, max(c.g, c.b)) - min(c.r, min(c.g, c.b));
+    return saturate(l + (c - l) * (1.16 + 0.25 * (1 - sat) * (1 - sat)));
+}
 float3 GradeColor(float3 c)
 {
+    if (g2.z > 1.5) return CourtLook(c);
+    if (g2.z > 0.01) c = CourtFresh(c);
     if (g0.x < 0.5) return c;
     // daylight white balance (g1.w): pulls the courts' pink/orange sunset cast back towards neutral,
     // keeping overall brightness; warm colours stay warm, greys and whites stop being pink
@@ -1808,6 +1988,7 @@ struct V { float4 pos : SV_Position; float2 uv : TEXCOORD0; };
 // clarity: local contrast against the average of a ring of samples (about 6 source pixels away)
 float3 Clarity(float2 uv, float3 c)
 {
+    if (g2.w > 0.001) { float2 q = (uv - 0.5) * 2; float dd = dot(q, q) * 0.5; c *= 1 + g2.w * dd * dd; }      // the game's dark corners (vignette) lifted back, courts only
     if (g0.x < 0.5 || g2.x <= 0) return c;
     float2 size; pic.GetDimensions(size.x, size.y);
     float2 r = 6.0 / size; float3 a = 0;
@@ -1886,7 +2067,7 @@ float4 ps_main(V i) : SV_Target
     D3D11_TEXTURE2D_DESC bd{}; back->GetDesc(&bd);
     if (!vs || !ps || !frontSrv)
     {
-        if (bd.Width == g_rtW && bd.Height == g_rtH) g_ctx->CopyResource(back, g_front);
+        if (bd.Width == g_rtW && bd.Height == g_rtH) g_ctx->CopyResource(back, g_showTex ? g_showTex : g_front);
         back->Release();
         return;
     }
@@ -1910,7 +2091,7 @@ float4 ps_main(V i) : SV_Target
     g_ctx->VSSetShader(vs, nullptr, 0);
     g_ctx->GSSetShader(nullptr, nullptr, 0);
     g_ctx->PSSetShader(ps, nullptr, 0);
-    g_ctx->PSSetShaderResources(0, 1, &frontSrv);
+    { ID3D11ShaderResourceView* showSrv = g_showSrv ? g_showSrv : frontSrv; g_ctx->PSSetShaderResources(0, 1, &showSrv); }
     g_ctx->PSSetSamplers(0, 1, &lin);
     if (gradeCb)
     {
@@ -1922,7 +2103,18 @@ float4 ps_main(V i) : SV_Target
             { 1, 0.035f, 1.06f, 0.22f, 1.05f, 0.40f, 0.00f, 0, 0, 0, 0, 0 } };
         int pr = std::clamp(g_colorPreset.load(), 0, 2);
         static int lastPr = -1;
-        if (pr != lastPr) { lastPr = pr; g_ctx->UpdateSubresource(gradeCb, 0, nullptr, presets[pr], 0, 0); Logf("[render] colours: %s\n", pr == 0 ? "original" : pr == 1 ? "natural" : "vivid"); }
+        // court frames (a court colour cube was used within the last 2 frames): pink / violet haze out + corners lifted.  NBASH_FRESH=0 off, NBASH_FRESH=<0..1> strength, NBASH_UNVIGNETTE=<0..1>
+        static const float freshK = [] { const char* v = getenv("NBASH_FRESH"); return v ? float(atof(v)) : 1.0f; }();
+        static const float unvig = [] { const char* v = getenv("NBASH_UNVIGNETTE"); return v ? float(atof(v)) : 0.55f; }();
+        bool court = freshK > 0 && pr != 0 && g_courtLutFrame != ~0ull && g_frame - g_courtLutFrame <= 2;
+        static int lastCourt = -1;
+        bool cleanComp = court && g_cleanCompFrame != ~0ull && g_frame - g_cleanCompFrame <= 2;
+        if (int(court) + 2 * int(cleanComp) != lastCourt)
+        {
+            lastCourt = int(court) + 2 * int(cleanComp); lastPr = pr; float cb[12]; memcpy(cb, presets[pr], sizeof cb); cb[10] = cleanComp ? 2.0f : court ? freshK : 0; cb[11] = cleanComp ? 0 : court ? unvig : 0;
+            g_ctx->UpdateSubresource(gradeCb, 0, nullptr, cb, 0, 0); Logf("[render] court colours %s\n", court ? "ON (fresh look)" : "off (menu)");
+        }
+        if (pr != lastPr) { lastPr = pr; lastCourt = -1; g_ctx->UpdateSubresource(gradeCb, 0, nullptr, presets[pr], 0, 0); Logf("[render] colours: %s\n", pr == 0 ? "original" : pr == 1 ? "natural" : "vivid"); }
         g_ctx->PSSetConstantBuffers(0, 1, &gradeCb);
     }
     g_ctx->Draw(3, 0);
@@ -1971,7 +2163,8 @@ void Present(uint32_t frontBuffer)
             logged++;
             Logf("[render] presenting front buffer %08X: %s\n", frontBuffer, ok ? "found" : "not a copy target, showing the last copy");
         }
-        if (ok) g_ctx->CopyResource(g_front, it->second.tex);
+        if (ok) { g_showTex = it->second.tex; g_showSrv = it->second.srv; g_needFallback = false; }
+        else { g_showTex = g_front; g_showSrv = nullptr; g_needFallback = true; }
     }
     CheckSceneBlack();
     EndFrame();
@@ -1979,6 +2172,29 @@ void Present(uint32_t frontBuffer)
     if (!g_swap) return;
     PresentScaled();
     g_swap->Present(0, 0);
+    // ---- 12 Nov 23:00 SHOT RECORDER: the first 5 standing shots of a custom player in a session are saved as a strip of frames (what is really on screen,
+    // every frame from the shoot press, scaled down to ~640 wide): capture\shotN_FF.bmp, the same names every session.  Started by shotswap.cpp.
+    {
+        extern std::atomic<int> g_shotBurstFrames;
+        static std::vector<std::vector<uint32_t>> frames; static uint32_t bw = 0, bh = 0; static int shotNo = 0;
+        int left = g_shotBurstFrames.load();
+        if (left > 0)
+        {
+            std::vector<uint32_t> px; uint32_t w = 0, h = 0;
+            if (ReadBack(px, w, h, false) && w && h)
+            {
+                uint32_t k = w / 640; if (k < 1) k = 1; bw = w / k; bh = h / k; std::vector<uint32_t> sm(size_t(bw) * bh);
+                for (uint32_t y = 0; y < bh; y++) for (uint32_t x = 0; x < bw; x++) sm[size_t(y) * bw + x] = px[size_t(y * k) * w + x * k];
+                frames.push_back(std::move(sm));
+            }
+            if (g_shotBurstFrames.fetch_sub(1) == 1 && !frames.empty())
+            {
+                int no = ++shotNo; auto fr = std::make_shared<std::vector<std::vector<uint32_t>>>(std::move(frames)); frames.clear(); uint32_t fw = bw, fh = bh;
+                CreateDirectoryA("capture", nullptr);
+                std::thread([no, fr, fw, fh] { for (size_t i = 0; i < fr->size(); i++) { char name[64]; snprintf(name, sizeof name, "capture\\shot%d_%02d.bmp", no, int(i)); WriteBmp(name, (*fr)[i], fw, fh); } Logf("[render] shot recorder: shot %d saved (%d frames, %ux%u)\n", no, int(fr->size()), fw, fh); }).detach();
+            }
+        }
+    }
     if (g_screenshotRequest.exchange(false))
     {
         std::vector<uint32_t> px; uint32_t w = 0, h = 0;
@@ -2024,6 +2240,7 @@ void Present(uint32_t frontBuffer)
 
 std::atomic<bool> g_tileCollapse{true};
 std::atomic<bool> g_screenshotRequest{false};
+std::atomic<int> g_shotBurstFrames{0};      // shot recorder: frames still to save (set by shotswap.cpp on a custom player's shoot press)
 
 // Writes a 24-bit BMP (pixels as 0xAABBGGRR, i.e. R in the low byte).
 static void WriteBmp(const char* name, const std::vector<uint32_t>& px, uint32_t w, uint32_t h)
@@ -2078,7 +2295,7 @@ bool ReadBack(std::vector<uint32_t>& pixels, uint32_t& width, uint32_t& height, 
 {
     if (!g_dev) return false;
     if (liveTarget) SyncRt();
-    ID3D11Texture2D* src = liveTarget ? g_rt : g_front;
+    ID3D11Texture2D* src = liveTarget ? g_rt : (g_showTex ? g_showTex : g_front);
     if (getenv("NBASH_READDEPTH"))      // debug: depth as grey levels (x8 for visibility), stencil in blue
     {
         D3D11_TEXTURE2D_DESC dd{};
@@ -2121,3 +2338,75 @@ bool ReadBack(std::vector<uint32_t>& pixels, uint32_t& width, uint32_t& height, 
 #endif
 
 ID3DBlob* NbashCompileShader(const char* src, const char* name, const char* profile, const char* entry) { return render::Compile(src, name, profile, entry); }
+
+
+// ---- 14 Nov, smooth frame pacing at the CHOSEN frame rate (graphics menu: 30 / 60 / 120; user: "we gotta do either 30, 60 or 120").
+// The game's one clock (gpu.cpp VblankThread) follows the real vblank of the display the window is on whenever the display's refresh rate is the chosen rate
+// or a whole multiple of it (60 on a 60 / 120 / 240 Hz display, 120 on 120 / 240, 30 on 60 / 120 ...): every n-th vblank is one game frame, so every frame
+// is on screen for exactly the same time. Otherwise (e.g. 60 on a 75 Hz display, 120 on a 60 Hz one) it returns 0 and the caller runs its precise timer.
+// The display's rate is read cheaply every 2 s (docking / another screen / a mode change) and only measured exactly (24 vblanks, ~0.3 s) when it has changed.
+// NBASH_VBLANK=timer forces the timer.
+extern "C" HWND NbashWindow();
+namespace render
+{
+static int PaceDiv(double hz, int fps) { int n = int(hz / fps + 0.5); return (n >= 1 && n <= 8 && std::fabs(hz / n - fps) <= 0.025 * fps) ? n : 0; }
+int WaitDisplayVblank(double* hzOut, int fps)
+{
+    static const bool off = [] { const char* e = getenv("NBASH_VBLANK"); return e && !strcmp(e, "timer"); }();
+    static IDXGIOutput* out = nullptr; static int div = 0, lastFps = 0, lastMode = -1, bad = 0, fails = 0; static double hz = 0; static bool never = false;
+    static std::chrono::steady_clock::time_point retry{}, polled{};
+    auto now = std::chrono::steady_clock::now();
+    if (hzOut) *hzOut = hz;
+    if (off || never || !g_swap) return 0;
+    auto drop = [&] { if (out) { out->Release(); out = nullptr; } div = 0; bad = 0; };
+    if (now - polled > std::chrono::seconds(2))      // which display, which mode?  (cheap, no waiting)
+    {
+        polled = now; int mode = 0;
+        if (HWND w = NbashWindow())
+        {
+            MONITORINFOEXW mi{}; mi.cbSize = sizeof mi;
+            if (GetMonitorInfoW(MonitorFromWindow(w, MONITOR_DEFAULTTONEAREST), &mi))
+            {
+                DEVMODEW dm{}; dm.dmSize = sizeof dm;
+                if (EnumDisplaySettingsW(mi.szDevice, ENUM_CURRENT_SETTINGS, &dm)) mode = int(dm.dmDisplayFrequency) + (int(mi.rcMonitor.left) * 31 + int(mi.rcMonitor.top)) * 1000;
+            }
+        }
+        if (mode != lastMode) { lastMode = mode; drop(); hz = 0; retry = now; }      // new display or new refresh rate: measure again
+    }
+    if (now < retry) return 0;
+    if (!out)
+    {
+        if (FAILED(g_swap->GetContainingOutput(&out)) || !out) { out = nullptr; if (++fails > 50) never = true; retry = now + std::chrono::seconds(5); return 0; }
+        if (hz == 0)
+        {
+            double dts[24]; bool ok = SUCCEEDED(out->WaitForVBlank());
+            auto t0 = std::chrono::steady_clock::now();
+            for (int i = 0; ok && i < 24; i++)
+            {
+                ok = SUCCEEDED(out->WaitForVBlank());
+                auto t1 = std::chrono::steady_clock::now(); dts[i] = std::chrono::duration<double>(t1 - t0).count(); t0 = t1;
+                if (dts[i] > 0.2) ok = false;
+            }
+            if (!ok) { drop(); retry = std::chrono::steady_clock::now() + std::chrono::seconds(10); return 0; }
+            std::sort(dts, dts + 24); hz = dts[12] > 0.0005 ? 1.0 / dts[12] : 0; lastFps = 0;
+        }
+    }
+    if (fps != lastFps)
+    {
+        lastFps = fps; div = PaceDiv(hz, fps);
+        if (div) Logf("[pace] display %.2f Hz, frame rate %d: one game frame every %d vblank%s of the display\n", hz, fps, div, div > 1 ? "s" : "");
+        else Logf("[pace] display %.2f Hz, frame rate %d: not a whole multiple - timer pacing (frames cannot all stay on screen equally long)\n", hz, fps);
+    }
+    if (hzOut) *hzOut = hz;
+    if (!div) return 0;
+    auto t0 = std::chrono::steady_clock::now();
+    for (int i = 0; i < div; i++) if (FAILED(out->WaitForVBlank())) { drop(); retry = std::chrono::steady_clock::now() + std::chrono::seconds(10); lastFps = 0; return 0; }
+    double dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    if (dt < 0.002 || dt > 0.08)
+    {
+        if (++bad > 8) { Logf("[pace] display vblank waits are off (%.1f ms) - timer pacing for 30 s\n", dt * 1000); if (++fails > 50) never = true; drop(); lastFps = 0; retry = std::chrono::steady_clock::now() + std::chrono::seconds(30); return 0; }
+    }
+    else bad = 0;
+    return 1;
+}
+}

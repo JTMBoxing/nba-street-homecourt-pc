@@ -860,6 +860,7 @@ IMPORT(XamUserCheckPrivilege) { TRACE(); W32(ARG(5).u32, 1); RETURN(0); }
 
 // ============================================================ files
 // Game paths (game:\..., d:\..., \Device\Cdrom0\...) map to the folder the disc was extracted to.
+uint8_t* NbashG2H(uint32_t a) { return G2H(a); }
 std::string GameRoot()
 {
     const char* env = getenv("NBASH_GAME_DIR");
@@ -1070,7 +1071,17 @@ IMPORT(NtReadFile)
             n = ArchiveModRead(of->overlay, of->f, pos, G2H(buf), len);
             FileSeek(of->f, int64_t(pos + n));
         }
-        else n = fread(G2H(buf), 1, len, of->f);
+        else
+        {
+#ifdef _WIN32
+            uint64_t start = uint64_t(_ftelli64(of->f));
+#else
+            uint64_t start = uint64_t(ftello(of->f));
+#endif
+            n = fread(G2H(buf), 1, len, of->f);
+            void NbashShoesOnRead(const std::string&, uint64_t, uint32_t, uint8_t*, size_t);
+            NbashShoesOnRead(of->path, start, buf, G2H(buf), n);      // shoe picker (shoes.cpp)
+        }
         if (of->path.find("movies") != std::string::npos)
         {
             static std::atomic<int> movieReads{0};

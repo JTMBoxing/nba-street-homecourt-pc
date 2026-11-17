@@ -13,6 +13,7 @@
 #include <atomic>
 
 int AudioQueuedBuffers();   // host output queue depth, -1 = no output (pace by the clock)
+void AudioLevelReport();    // 10 s level / limiter line
 
 namespace
 {
@@ -61,6 +62,7 @@ namespace
                     Log("[audio] 10 s: %llu frames (%.0f/s, need 187.5), mixer avg %.2f ms max %.1f ms, slow %llu, output ran dry %llu, dropped %llu, queued %d\n",
                         (unsigned long long)n, n / std::chrono::duration<double>(t1 - last).count(), sum / n, mx,
                         (unsigned long long)slow, (unsigned long long)g_dry.exchange(0), (unsigned long long)g_droppedOut.exchange(0), AudioQueuedBuffers());
+                    AudioLevelReport();
                     sum = 0; mx = 0; n = 0; slow = 0; last = t1;
                 }
             }
@@ -146,7 +148,15 @@ namespace
     IXAudio2MasteringVoice* g_master = nullptr;
     IXAudio2SourceVoice* g_voice = nullptr;
     constexpr int kBufs = 64;
-    float g_bufs[kBufs][256 * 2];
+    float g_bufs[kBufs][256 * 6];
+    // 14 Nov (audio polish): the game mixes 5.1 (crowd / court ambience largely in the surround channels).
+    //  - a 5.1 / 7.1 / spatial (Windows Sonic, Dolby Atmos for headphones) output now gets all 6 channels as they are (real surround);
+    //  - stereo gets a proper downmix (front + 0.707 centre + 0.707 surround + LFE) through a smooth peak LIMITER instead of hard clipping
+    //    at full scale (the old way crackled on loud moments: crowd + music + dunk could sum to ~2.5x full scale).
+    int g_outCh = 2;                     // channels sent to the sound device (2 or 6)
+    float g_limGain = 1.0f;              // limiter gain (1 = untouched)
+    uint64_t g_limFrames = 0;            // frames where the limiter worked (status line)
+    float g_peak = 0.0f;                 // loudest sample before the limiter in the last 10 s
     int g_next = 0;
     std::atomic<int> g_state{0};   // 0 not tried, 1 ready, 2 failed / off
     uint64_t g_dropped = 0;
@@ -164,11 +174,25 @@ namespace
         Log("[audio] XAudio2 library %s\n", create ? "found" : "missing");
         if (!create || FAILED(create(&g_xa, 0, XAUDIO2_DEFAULT_PROCESSOR))) { Log("[audio] XAudio2 not available - no sound\n"); return false; }
         Log("[audio] XAudio2 created\n");
-        if (FAILED(g_xa->CreateMasteringVoice(&g_master, 2, 48000, 0, nullptr, nullptr, AudioCategory_GameEffects))) { Log("[audio] no sound device\n"); return false; }
-        WAVEFORMATEX wf{};
-        wf.wFormatTag = WAVE_FORMAT_IEEE_FLOAT; wf.nChannels = 2; wf.nSamplesPerSec = 48000;
-        wf.wBitsPerSample = 32; wf.nBlockAlign = 8; wf.nAvgBytesPerSec = 48000 * 8;
-        if (FAILED(g_xa->CreateSourceVoice(&g_voice, &wf, 0, 2.0f, nullptr, nullptr, nullptr))) { Log("[audio] could not create a sound voice\n"); return false; }
+        // the device's own channel count (XAUDIO2_DEFAULT_CHANNELS): 6+ = surround output; NBASH_STEREO=1 forces the stereo downmix
+        if (FAILED(g_xa->CreateMasteringVoice(&g_master, XAUDIO2_DEFAULT_CHANNELS, 48000, 0, nullptr, nullptr, AudioCategory_GameEffects)) &&
+            FAILED(g_xa->CreateMasteringVoice(&g_master, 2, 48000, 0, nullptr, nullptr, AudioCategory_GameEffects))) { Log("[audio] no sound device\n"); return false; }
+        XAUDIO2_VOICE_DETAILS md{}; g_master->GetVoiceDetails(&md);
+        g_outCh = (md.InputChannels >= 6 && !getenv("NBASH_STEREO")) ? 6 : 2;
+        WAVEFORMATEXTENSIBLE wx{};
+        wx.Format.wFormatTag = WAVE_FORMAT_EXTENSIBLE; wx.Format.nChannels = WORD(g_outCh); wx.Format.nSamplesPerSec = 48000;
+        wx.Format.wBitsPerSample = 32; wx.Format.nBlockAlign = WORD(4 * g_outCh); wx.Format.nAvgBytesPerSec = 48000 * 4 * g_outCh;
+        wx.Format.cbSize = sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX); wx.Samples.wValidBitsPerSample = 32;
+        wx.dwChannelMask = g_outCh == 6 ? (SPEAKER_FRONT_LEFT | SPEAKER_FRONT_RIGHT | SPEAKER_FRONT_CENTER | SPEAKER_LOW_FREQUENCY | SPEAKER_BACK_LEFT | SPEAKER_BACK_RIGHT)
+                                        : (SPEAKER_FRONT_LEFT | SPEAKER_FRONT_RIGHT);
+        static const GUID kFloat = { 0x00000003, 0x0000, 0x0010, { 0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71 } };   // KSDATAFORMAT_SUBTYPE_IEEE_FLOAT
+        wx.SubFormat = kFloat;
+        if (FAILED(g_xa->CreateSourceVoice(&g_voice, &wx.Format, 0, 2.0f, nullptr, nullptr, nullptr)))
+        {
+            if (g_outCh == 6) { Log("[audio] surround voice refused - stereo\n"); g_outCh = 2; wx.Format.nChannels = 2; wx.Format.nBlockAlign = 8; wx.Format.nAvgBytesPerSec = 48000 * 8; wx.dwChannelMask = SPEAKER_FRONT_LEFT | SPEAKER_FRONT_RIGHT; }
+            if (FAILED(g_xa->CreateSourceVoice(&g_voice, &wx.Format, 0, 2.0f, nullptr, nullptr, nullptr))) { Log("[audio] could not create a sound voice\n"); return false; }
+        }
+        Log("[audio] sound device: %u channels -> game sound sent as %s\n", unsigned(md.InputChannels), g_outCh == 6 ? "5.1 surround (as the game mixes it)" : "stereo (downmix + limiter)");
         const char* v = getenv("NBASH_VOLUME");
         g_voice->SetVolume(v ? float(atof(v)) : 1.0f);
         g_voice->Start(0, 0);
@@ -189,19 +213,35 @@ namespace
         // 6 channels (front L, front R, centre, LFE, surround L, surround R) x 256 samples
         auto in = [&](int ch, int i) { uint32_t b = R32(samples + uint32_t(ch * 256 + i) * 4); float f; memcpy(&f, &b, 4); return f; };
         float* out = g_bufs[g_next];
-        bool loud = false;
+        bool loud = false, limited = false;
+        // smooth peak limiter: ceiling just under full scale, instant attack (gain drops to fit the peak), ~80 ms release - no hard clipping
+        const float ceil_ = 0.95f, rel = 1.0f - 1.0f / (0.080f * 48000.0f);
+        const int nc = g_outCh;
         for (int i = 0; i < 256; i++)
         {
-            float c = in(2, i) * 0.7071f, lfe = in(3, i) * 0.5f;
-            float l = in(0, i) + c + in(4, i) * 0.7071f + lfe;
-            float r = in(1, i) + c + in(5, i) * 0.7071f + lfe;
-            out[i * 2] = l > 1.0f ? 1.0f : l < -1.0f ? -1.0f : l;
-            out[i * 2 + 1] = r > 1.0f ? 1.0f : r < -1.0f ? -1.0f : r;
-            if (l > 0.001f || l < -0.001f || r > 0.001f || r < -0.001f) loud = true;
+            float v[6];
+            if (nc == 6) { for (int ch = 0; ch < 6; ch++) v[ch] = in(ch, i); }
+            else
+            {
+                float c = in(2, i) * 0.7071f, lfe = in(3, i) * 0.5f;
+                v[0] = in(0, i) + c + in(4, i) * 0.7071f + lfe;
+                v[1] = in(1, i) + c + in(5, i) * 0.7071f + lfe;
+            }
+            float pk = 0.0f; for (int ch = 0; ch < nc; ch++) { float a = v[ch] < 0 ? -v[ch] : v[ch]; if (a > pk) pk = a; }
+            if (pk > g_peak) g_peak = pk;
+            if (pk * g_limGain > ceil_) { g_limGain = ceil_ / pk; limited = true; }
+            else g_limGain = 1.0f - (1.0f - g_limGain) * rel;
+            for (int ch = 0; ch < nc; ch++)
+            {
+                float o = v[ch] * g_limGain; o = o > 1.0f ? 1.0f : o < -1.0f ? -1.0f : o;
+                out[i * nc + ch] = o;
+                if (o > 0.001f || o < -0.001f) loud = true;
+            }
         }
         if (loud) g_loudFrames++;
+        if (limited) g_limFrames++;
         XAUDIO2_BUFFER b{};
-        b.AudioBytes = 256 * 2 * 4; b.pAudioData = (const BYTE*)out;
+        b.AudioBytes = 256 * nc * 4; b.pAudioData = (const BYTE*)out;
         g_voice->SubmitSourceBuffer(&b, nullptr);
         g_next = (g_next + 1) % kBufs;
     }
@@ -211,6 +251,12 @@ namespace { void PlayFrame(uint32_t samples) { DumpFrame(samples); } }
 #endif
 
 #ifdef _WIN32
+void AudioLevelReport()
+{
+    if (g_state.load() != 1) return;
+    Log("[audio] level: loudest %.2f x full scale, limiter worked in %llu frames (of ~1875)%s\n", g_peak, (unsigned long long)g_limFrames, g_outCh == 6 ? ", 5.1 output" : "");
+    g_peak = 0.0f; g_limFrames = 0;
+}
 int AudioQueuedBuffers()
 {
     if (g_state.load() != 1 || !g_voice) return -1;
@@ -219,6 +265,7 @@ int AudioQueuedBuffers()
     return int(vs.BuffersQueued);
 }
 #else
+void AudioLevelReport() {}
 int AudioQueuedBuffers() { return -1; }
 #endif
 

@@ -66,8 +66,14 @@ int main(int argc, char** argv)
         MoveFileExA("nbash_log_prev.txt", "nbash_log_prev2.txt", MOVEFILE_REPLACE_EXISTING);
         MoveFileExA("nbash_log.txt", "nbash_log_prev.txt", MOVEFILE_REPLACE_EXISTING);
         freopen("nbash_log.txt", "w", stdout);
+        // main-build defaults (a launcher can still override each one; "0" switches it off):
+        // drive camera with the in-game camera menu, inbound from behind the baseline, no full-court press by the computer
         {
-            const char* vars[] = { "NBASH_RES_SCALE", "NBASH_MSAA", "NBASH_ANISO", "NBASH_NOMIPS", "NBASH_RSTICK", "NBASH_RS_HOLDMS", "NBASH_RS_BUMPERMS", "NBASH_GPU" };
+            const char* defs[][2] = { { "NBASH_DRIVECAM", "1" }, { "NBASH_INBOUND", "baseline" }, { "NBASH_NOPRESS", "1" } };
+            for (auto& d : defs) if (!getenv(d[0])) SetEnvironmentVariableA(d[0], d[1]), _putenv_s(d[0], d[1]);
+        }
+        {
+            const char* vars[] = { "NBASH_RES_SCALE", "NBASH_MSAA", "NBASH_ANISO", "NBASH_NOMIPS", "NBASH_RSTICK", "NBASH_RS_HOLDMS", "NBASH_RS_BUMPERMS", "NBASH_GPU", "NBASH_DRIVECAM", "NBASH_INBOUND", "NBASH_NOPRESS", "NBASH_RELAY" };
             for (const char* v : vars) if (getenv(v)) printf("[setting] %s=%s\n", v, getenv(v));
         }
         timeBeginPeriod(1);   // 1 ms sleep accuracy for 60 Hz timing

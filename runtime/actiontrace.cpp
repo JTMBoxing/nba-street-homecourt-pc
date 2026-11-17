@@ -506,6 +506,19 @@ PPC_FUNC(sub_82274268)
 {
     uint32_t c = ctx.r3.u32;
     uint64_t before = R64(c + 8);
+    // match-start inbound fast-forward (drivecam.cpp): the game clock's own speed factor (c+24, 1.0 normally) is raised
+    {
+        extern std::atomic<uint64_t> g_nbashFastUntil; extern float g_nbashFastSpeed;
+        static bool on = false; uint64_t until = g_nbashFastUntil.load();
+        bool want = until && NbashMs() < until;
+        auto WFl = [](uint32_t a, float f) { uint32_t v; memcpy(&v, &f, 4); W32(a, v); };
+        if (want) { WFl(c + 24, g_nbashFastSpeed); on = true; }
+        else if (on) { WFl(c + 24, 1.0f); on = false; }
+        // slower jump shot for chosen players (shotswap.cpp): the same speed factor, below 1
+        extern float NbashShotSlowSpeed(); static bool slowOn = false;
+        if (!want) { float sp = NbashShotSlowSpeed(); if (sp < 0.999f) { WFl(c + 24, sp); slowOn = true; } else if (slowOn) { WFl(c + 24, 1.0f); slowOn = false; } }
+    }
+    { extern void NbashShotSwapTick(); NbashShotSwapTick(); }       // per-player jump shots (shotswap.cpp)
     __imp__sub_82274268(ctx, base);
     static std::atomic<int> n{0};
     int k = n++;

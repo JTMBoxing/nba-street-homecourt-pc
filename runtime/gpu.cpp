@@ -6,6 +6,8 @@
 #include "guest.h"
 #include <chrono>
 #include <condition_variable>
+namespace render { int WaitDisplayVblank(double* hzOut, int fps); }
+int NbashFps();
 #include <thread>
 #include <vector>
 #include <map>
@@ -566,15 +568,39 @@ namespace
         }
     }
 
-    // 60 Hz display refresh (Xenia's MarkVblank): counter + vblank interrupt on CPU 2
+    // 60 Hz display refresh (Xenia's MarkVblank): counter + vblank interrupt on CPU 2.
+    // 13 Nov (smooth pacing): ONE clock for everything. The tick follows the real monitor's vblank when it can (render::WaitDisplayVblank), otherwise a
+    // precise 60 Hz timer (sleep to 2 ms before, then spin - a plain sleep_until was up to 1-2 ms late). The game's main loop now waits for this tick
+    // (loopstats.cpp) instead of running on a second, unrelated 60 Hz timer: the two timers drifted against each other, so frames alternately caught and
+    // missed the vblank the game's own GPU wait is tied to (measured: frame times 9 .. 26 ms at "60 fps"). NBASH_OLDPACE=1 = the old behaviour.
+    std::mutex g_vbMutex; std::condition_variable g_vbCv;
+    std::atomic<int> g_vbReal{0}; std::atomic<int> g_vbHz100{0};
     void VblankThread()
     {
+        static const bool old = getenv("NBASH_OLDPACE") != nullptr;
         auto next = std::chrono::steady_clock::now();
         for (;;)
         {
-            next += std::chrono::microseconds(16667);
-            std::this_thread::sleep_until(next);
-            g_vblankCounter++;
+            bool real = false; int fps = old ? 60 : NbashFps();
+#ifdef _WIN32
+            if (!old) { double hz = 0; real = render::WaitDisplayVblank(&hz, fps) == 1; g_vbHz100 = int(hz * 100); }
+#endif
+            g_vbReal = real;
+            if (real) next = std::chrono::steady_clock::now();
+            else
+            {
+                next += std::chrono::nanoseconds(1000000000ll / fps);
+                auto now = std::chrono::steady_clock::now();
+                if (next < now - std::chrono::milliseconds(50)) next = now;
+                if (old) std::this_thread::sleep_until(next);
+                else
+                {
+                    if (next - now > std::chrono::milliseconds(3)) std::this_thread::sleep_until(next - std::chrono::milliseconds(2));
+                    while (std::chrono::steady_clock::now() < next) std::this_thread::yield();
+                }
+            }
+            { std::lock_guard<std::mutex> lk(g_vbMutex); g_vblankCounter++; }
+            g_vbCv.notify_all();
             W32(kRegisterBase + REG_D1MODE_VBLANK_STATUS * 4, 1);
             Interrupt(0, 2);
         }
@@ -649,6 +675,14 @@ namespace
 
 uint64_t GpuFrameCount() { return g_swaps; }
 uint32_t VblankCount() { return g_vblankCounter; }
+// waits (at most 50 ms) until the vblank counter is no longer `last`; returns the new count
+uint32_t NbashWaitVblank(uint32_t last)
+{
+    std::unique_lock<std::mutex> lk(g_vbMutex);
+    g_vbCv.wait_for(lk, std::chrono::milliseconds(50), [&] { return g_vblankCounter.load() != last; });
+    return g_vblankCounter.load();
+}
+int NbashVblankSource(int* hz100) { if (hz100) *hz100 = g_vbHz100; return g_vbReal; }
 uint64_t GpuDrawCount() { return g_draws; }
 uint32_t GpuFrontBuffer() { return g_frontBuffer; }
 

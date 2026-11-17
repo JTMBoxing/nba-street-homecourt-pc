@@ -78,3 +78,6 @@ version, GPU, and the `nbash_log.txt` written next to the exe. Never attach game
 - [XenonRecomp](https://github.com/hedge-dev/XenonRecomp) (MIT) — the static recompiler.
 - Parts of [Xenia](https://github.com/xenia-project/xenia) (BSD) — see `thirdparty/xenia/LICENSE`.
 - Fonts used by the ratings screen: Roboto Slab and Permanent Marker (Apache 2.0) — see `third_party/fonts/`.
+
+## Beta 0.1
+See [RELEASE_NOTES.md](RELEASE_NOTES.md) for the player list, what changed and how to install. Testers download the release zip (Install.exe) from the Releases page and use their own NBA Street Homecourt (USA) .iso. `installer/` holds the installer source, `release_tools/` the scripts that build the patch set from a disc image.
