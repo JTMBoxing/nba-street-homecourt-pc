@@ -285,6 +285,14 @@ int main(int argc, char** argv)
     bool orig = line[0] == '2';
     if (FILE* c = fopen((root / "nbash_controls.txt").string().c_str(), "w")) { fprintf(c, "%s\n\nController layout: first word = new or original. Change it any time.\n", orig ? "original" : "new"); fclose(c); }
     say("  layout: %s (change it any time in nbash_controls.txt)\n", orig ? "ORIGINAL" : "NEW");
+    say("\nPlay in full screen? (Alt+Enter or the F1 graphics menu switch it any time)  Y/n [Y]: ");
+    char fsl[64] = {}; if (!fgets(fsl, sizeof fsl, stdin)) fsl[0] = 'y';
+    bool full = !(fsl[0] == 'n' || fsl[0] == 'N');
+    {   // keep the tester's other graphics settings (frame rate, colour look) - only the fullscreen line changes
+        std::vector<std::string> keep; { std::ifstream in(root / "nbash_graphics.txt"); std::string l; while (std::getline(in, l)) if (l.rfind("fullscreen", 0) != 0 && !l.empty()) keep.push_back(l); }
+        if (FILE* g = fopen((root / "nbash_graphics.txt").string().c_str(), "w")) { fprintf(g, "fullscreen %d\n", full ? 1 : 0); for (auto& l : keep) fprintf(g, "%s\n", l.c_str()); fclose(g); }
+    }
+    say("  %s\n", full ? "full screen" : "window");
 
     say("\nDone! Start the game with \"Play NBA Street Homecourt.bat\".\nThis is a BETA: if anything goes wrong, send nbash_log.txt (and install_log.txt) with your report.\n");
     pauseExit(0);

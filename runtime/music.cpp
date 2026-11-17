@@ -303,6 +303,14 @@ namespace
         const auto& lib = Library();
         if (lib.empty()) { Log("[music] no songs found\n"); return; }
         Log("[music] %zu songs - they replace the game's soundtrack\n", lib.size());
+        // 16 Nov (user: "have the music not start playing until you get into the main menu"): wait for the game's own first song
+        // request - it comes when the front end / main menu starts (after the saves load). Safety net: 120 s.
+        {
+            auto t0 = std::chrono::steady_clock::now();
+            while (g_request.load() < 0 && std::chrono::steady_clock::now() - t0 < std::chrono::seconds(120)) std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            Log("[music] %s - music starts now\n", g_request.load() >= 0 ? "main menu reached" : "no menu song request after 120 s");
+            g_command = 0;      // the request's "end the current song" is for nothing yet: don't let it skip the first song
+        }
         CoInitializeEx(nullptr, COINIT_MULTITHREADED);
         bool mf = SUCCEEDED(MFStartup(MF_VERSION, MFSTARTUP_LITE)) && InitOutput();
         if (!mf) Log("[music] Media Foundation / XAudio2 not available - plain playback, no levelling\n");
